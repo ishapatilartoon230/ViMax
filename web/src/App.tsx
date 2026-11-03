@@ -35,7 +35,7 @@ import {ArtifactsView, StoryboardPanel} from './ArtifactViews';
 import {applyAgentEvent, appendLocalUser, composeAgentPrompt, createChatState, humanize} from './events';
 import {matchingSlashCommands, shouldShowSlashCommands, type SlashCommandMatch} from './slashCommands';
 import {applyTheme, resolveTheme, THEME_STORAGE_KEY, type Theme} from './theme';
-import type {AgentConfig, AgentEvent, Artifact, ChatState, ConfigSection, Message, SessionSummary, WorkspaceUpload} from './types';
+import type {AgentConfig, AgentEvent, Artifact, ChatState, ConfigSection, Message, RenderConfigSection, SessionSummary, WorkspaceUpload} from './types';
 
 const CONTEXT_TARGET = 160_000;
 
@@ -677,7 +677,7 @@ function SlashCommandMenu({matches, contextPercent, onSelect}: {matches: SlashCo
   );
 }
 
-const CONFIG_SECTIONS: Array<{key: keyof AgentConfig['sections']; title: string; description: string}> = [
+const CONFIG_SECTIONS: Array<{key: 'llm' | 'image' | 'video' | 'embedding' | 'reranker'; title: string; description: string}> = [
   {key: 'llm', title: 'Agent LLM', description: 'Planning, tool selection, and conversation'},
   {key: 'image', title: 'Image generation', description: 'Characters, keyframes, and shot frames'},
   {key: 'video', title: 'Video generation', description: 'Shot clips and final video'},
@@ -708,6 +708,23 @@ function SettingsView() {
         [section]: {...current.sections[section], [field]: value},
       },
     } : current);
+  }
+
+  function updateRender(patch: Partial<RenderConfigSection>) {
+    setStatus('');
+    setConfig((current) => current ? {
+      sections: {...current.sections, render: {...current.sections.render, ...patch}},
+    } : current);
+  }
+
+  function updateRenderOrientation(aspectRatio: string) {
+    const vertical = aspectRatio === '9:16';
+    updateRender({
+      image_aspect_ratio: aspectRatio,
+      video_aspect_ratio: aspectRatio,
+      image_size: vertical ? '1080x1920' : '1600x900',
+      allow_portrait: vertical ? 'true' : 'false',
+    });
   }
 
   async function save() {
@@ -746,6 +763,11 @@ function SettingsView() {
             onChange={(field, value) => update(definition.key, field, value)}
           />
         ))}
+        <RenderSettingsEditor
+          value={config.sections.render}
+          onOrientationChange={updateRenderOrientation}
+          onFieldChange={updateRender}
+        />
       </div>
     </section>
   );
@@ -769,6 +791,36 @@ function ConfigSectionEditor({definition, value, onChange}: {
           <span>API key <i className={value.has_api_key ? 'is-configured' : ''}>{value.has_api_key ? 'Configured' : 'Not configured'}</i></span>
           <input type="password" value={value.api_key} onChange={(event) => onChange('api_key', event.target.value)} placeholder={value.has_api_key ? 'Leave blank to keep current key' : 'Enter API key'} autoComplete="off" />
         </label>
+      </div>
+    </section>
+  );
+}
+
+function RenderSettingsEditor({value, onOrientationChange, onFieldChange}: {
+  value: RenderConfigSection;
+  onOrientationChange: (aspectRatio: string) => void;
+  onFieldChange: (patch: Partial<RenderConfigSection>) => void;
+}) {
+  const orientation = value.video_aspect_ratio === '9:16' ? '9:16' : '16:9';
+  return (
+    <section className="config-section">
+      <header><h2>Video format</h2><p>Aspect ratio and resolution for rendered frames, clips, and the final video</p></header>
+      <div className="config-fields">
+        <label>
+          <span>Orientation</span>
+          <select value={orientation} onChange={(event) => onOrientationChange(event.target.value)}>
+            <option value="16:9">Landscape 16:9</option>
+            <option value="9:16">Vertical 9:16</option>
+          </select>
+        </label>
+        <label>
+          <span>Video resolution</span>
+          <select value={value.video_resolution || '720p'} onChange={(event) => onFieldChange({video_resolution: event.target.value})}>
+            <option value="720p">720p</option>
+            <option value="1080p">1080p</option>
+          </select>
+        </label>
+        <label><span>Frame size hint</span><input value={value.image_size} onChange={(event) => onFieldChange({image_size: event.target.value})} /></label>
       </div>
     </section>
   );

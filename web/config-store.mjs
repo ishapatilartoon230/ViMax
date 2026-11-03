@@ -8,6 +8,7 @@ const SECTION_FIELDS = {
   video: ['model', 'base_url'],
   embedding: ['model_provider', 'model', 'base_url'],
   reranker: ['model', 'base_url'],
+  render: ['image_aspect_ratio', 'image_size', 'video_aspect_ratio', 'video_resolution', 'allow_portrait'],
 };
 
 export async function readAgentConfig(repoRoot) {

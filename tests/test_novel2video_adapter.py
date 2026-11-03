@@ -272,7 +272,7 @@ class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
                  patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters._build_novel_render_pipeline", side_effect=lambda working_dir, chat_model, image_generator, video_generator, num_image_candidates=2: FakeNovelRenderPipeline(Path(working_dir))) as factory:
+                 patch("agent_runtime.vimax_adapters._build_novel_render_pipeline", side_effect=lambda working_dir, chat_model, image_generator, video_generator, num_image_candidates=2, render_geometry=None: FakeNovelRenderPipeline(Path(working_dir))) as factory:
                 result = await adapter.vimax_render_video({}, runtime)
             self.assertTrue(result.ok)
             self.assertEqual(factory.call_args.kwargs["num_image_candidates"], 3)

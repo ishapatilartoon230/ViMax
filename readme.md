@@ -235,24 +235,26 @@ ViMax also provides a minimal TUI for interactive agent-based video creation. Cr
 cp configs/agent.example.yaml configs/agent.local.yaml
 ```
 
-Then configure the model and API key information in `configs/agent.local.yaml`, including the LLM, image generator, and video generator, as shown below.
+Then configure the model and API key information in `configs/agent.local.yaml`, including the LLM, image generator, and video generator, as shown below. The defaults target the official Google Gemini API, so a single Google AI Studio API key drives all services.
 ```yaml
 llm:
   model_provider: openai
-  model: <YOUR_LLM_MODEL>
-  base_url: <YOUR_LLM_BASE_URL>
-  api_key: <YOUR_API_KEY>
+  model: gemini-3.8-flash
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  api_key: <YOUR_GOOGLE_API_KEY>
 
 image:
-  model: <YOUR_IMAGE_MODEL>
-  base_url: <YOUR_IMAGE_BASE_URL>
-  api_key: <YOUR_API_KEY>
+  model: gemini-3.1-flash-image
+  base_url: https://generativelanguage.googleapis.com
+  api_key: <YOUR_GOOGLE_API_KEY>  # Falls back to llm.api_key when empty
 
 video:
-  model: <YOUR_VIDEO_MODEL>
-  base_url: <YOUR_VIDEO_BASE_URL>
-  api_key: <YOUR_API_KEY>
+  model: gemini-omni-1.1-flash
+  base_url: https://generativelanguage.googleapis.com
+  api_key: <YOUR_GOOGLE_API_KEY>  # Falls back to llm.api_key when empty
 ```
+
+Alternative gateways such as yunwu.ai or OpenRouter remain available: set the corresponding `base_url` and model names, and the runtime picks the matching adapter automatically.
 
 Then, start the TUI from the ViMax root directory:
 ```bash
@@ -316,20 +318,21 @@ You need to configure the model and API key information in the configs/idea2vide
 ```yaml
 chat_model:
   init_args:
-    model: google/gemini-2.5-flash-lite-preview-09-2025
+    model: gemini-3.8-flash
     model_provider: openai
-    api_key: <YOUR_API_KEY>
-    base_url: https://openrouter.ai/api/v1
+    api_key: <YOUR_GOOGLE_API_KEY>
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
 
 image_generator:
   class_path: tools.ImageGeneratorNanobananaGoogleAPI
   init_args:
-    api_key: <YOUR_API_KEY>
+    api_key: <YOUR_GOOGLE_API_KEY>
 
 video_generator:
-  class_path: tools.VideoGeneratorVeoGoogleAPI
+  class_path: tools.VideoGeneratorOmniGoogleAPI
   init_args:
-    api_key: <YOUR_API_KEY>
+    api_key: <YOUR_GOOGLE_API_KEY>
+    model: gemini-omni-1.1-flash
 
 working_dir: .working_dir/idea2video
 ```

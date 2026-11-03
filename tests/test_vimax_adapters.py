@@ -17,8 +17,9 @@ from pipelines.script2video_pipeline import Script2VideoPipeline
 
 
 class FakeIdeaPipeline:
-    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2):
+    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2, render_geometry=None):
         self.num_image_candidates = num_image_candidates
+        self.render_geometry = render_geometry
         self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,8 +72,9 @@ class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
 
 
 class FakeScriptPipeline:
-    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2):
+    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2, render_geometry=None):
         self.num_image_candidates = num_image_candidates
+        self.render_geometry = render_geometry
         self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
 

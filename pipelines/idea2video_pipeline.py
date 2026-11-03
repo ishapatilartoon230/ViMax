@@ -14,6 +14,7 @@ from utils.provider_presets import resolve_chat_model_config
 from utils.text import safe_path_component
 from utils.video import concatenate_video_files
 from utils.image_selection import DEFAULT_IMAGE_CANDIDATES, image_candidate_count_from_config, validate_image_candidate_count
+from utils.render_geometry import normalize_render_geometry
 
 
 def _pipeline_print(quiet: bool, message: str) -> None:
@@ -29,11 +30,13 @@ class Idea2VideoPipeline:
         video_generator: str,
         working_dir: str,
         num_image_candidates: int = DEFAULT_IMAGE_CANDIDATES,
+        render_geometry: Optional[Dict[str, Any]] = None,
     ):
         self.chat_model = chat_model
         self.image_generator = image_generator
         self.video_generator = video_generator
         self.num_image_candidates = validate_image_candidate_count(num_image_candidates)
+        self.render_geometry = normalize_render_geometry(render_geometry)
         self.working_dir = working_dir
         os.makedirs(self.working_dir, exist_ok=True)
 
@@ -58,6 +61,7 @@ class Idea2VideoPipeline:
             video_generator=backend.video_generator,
             working_dir=config["working_dir"],
             num_image_candidates=image_candidate_count_from_config(config),
+            render_geometry=config.get("render") if isinstance(config.get("render"), dict) else None,
         )
 
     async def extract_characters(
@@ -256,6 +260,7 @@ class Idea2VideoPipeline:
                 video_generator=self.video_generator,
                 working_dir=scene_working_dir,
                 num_image_candidates=self.num_image_candidates,
+                render_geometry=self.render_geometry,
             )
             final_video_path = await script2video_pipeline(
                 script=scene_script,

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from agent_runtime.llm import OpenAICompatibleLLM
+from agent_runtime.loop import _openai_tool_call
 
 
 class AgentLLMTests(unittest.IsolatedAsyncioTestCase):
@@ -42,6 +43,30 @@ class AgentLLMTests(unittest.IsolatedAsyncioTestCase):
         }))))
         message = await llm.complete([], [])
         self.assertEqual(message.text, "hello")
+
+    async def test_thought_signature_is_captured_and_roundtripped(self):
+        llm = OpenAICompatibleLLM(model="test", base_url="https://example.invalid/v1", api_key="test-key")
+        llm.client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=AsyncMock(return_value={
+            "choices": [{"message": {"content": "", "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "list_files", "arguments": "{}"},
+                "extra_content": {"google": {"thought_signature": "SIG123"}},
+            }]}}]}
+        ))))
+        message = await llm.complete([], [])
+        call = message.tool_calls[0]
+        self.assertEqual(call.thought_signature, "SIG123")
+        # The signature never leaks into logged dicts...
+        self.assertNotIn("thought_signature", call.as_dict())
+        # ...but the replay payload carries it for Gemini thinking models.
+        self.assertEqual(_openai_tool_call(call)["extra_content"], {"google": {"thought_signature": "SIG123"}})
+
+    async def test_replay_payload_omits_signature_when_absent(self):
+        from agent_runtime.models import ToolCall
+
+        payload = _openai_tool_call(ToolCall(name="list_files", arguments={}, id="call_2"))
+        self.assertNotIn("extra_content", payload)
 
 
 if __name__ == "__main__":

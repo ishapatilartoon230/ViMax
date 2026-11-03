@@ -24,9 +24,10 @@ image_generator:
   max_requests_per_day: 500
 
 video_generator:
-  class_path: tools.VideoGeneratorVeoGoogleAPI
+  class_path: tools.VideoGeneratorOmniGoogleAPI
   init_args:
     api_key:
+    model: gemini-omni-1.1-flash
   max_requests_per_minute: 2
   max_requests_per_day: 10
 

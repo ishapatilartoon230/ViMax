@@ -102,8 +102,29 @@ def _assistant_message_from_response(response: Any) -> AssistantMessage:
             arguments = json.loads(_message_value(function, "arguments") or "{}")
         except json.JSONDecodeError:
             arguments = {}
-        calls.append(ToolCall(id=_message_value(call, "id") or f"tool-{uuid4().hex[:12]}", name=_message_value(function, "name"), arguments=arguments))
+        calls.append(ToolCall(id=_message_value(call, "id") or f"tool-{uuid4().hex[:12]}", name=_message_value(function, "name"), arguments=arguments, thought_signature=_thought_signature(call)))
     return AssistantMessage(text=text, tool_calls=calls, raw_message=_dump_message(message))
+
+
+def _thought_signature(call: Any) -> str:
+    """Extract a Gemini thought_signature from a tool call, if present.
+
+    Thinking models attach the signature through a provider extension field
+    (``extra_content.google.thought_signature``); replaying a function call
+    without it is rejected by the API with HTTP 400.
+    """
+    extra = _message_value(call, "extra_content")
+    if not isinstance(extra, dict):
+        model_extra = getattr(call, "model_extra", None)
+        if isinstance(model_extra, dict):
+            extra = model_extra.get("extra_content")
+    if isinstance(extra, dict):
+        google = extra.get("google")
+        if isinstance(google, dict):
+            signature = google.get("thought_signature")
+            if isinstance(signature, str) and signature:
+                return signature
+    return ""
 
 
 def _extract_message(response: Any) -> Any:

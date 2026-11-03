@@ -11,6 +11,7 @@ from scenedetect import open_video, SceneManager, split_video_ffmpeg
 from scenedetect.detectors import ContentDetector
 
 from interfaces import ShotDescription, ShotBriefDescription, Camera, ImageOutput, VideoOutput
+from utils.render_geometry import normalize_render_geometry
 
 
 from moviepy import VideoFileClip
@@ -113,10 +114,12 @@ class CameraImageGenerator:
         chat_model,
         image_generator,
         video_generator,
+        render_geometry: Optional[dict] = None,
     ):
         self.chat_model = chat_model
         self.image_generator = image_generator
         self.video_generator = video_generator
+        self.render_geometry = normalize_render_geometry(render_geometry)
 
 
     async def construct_camera_tree(
@@ -196,6 +199,8 @@ class CameraImageGenerator:
         video_output = await self.video_generator.generate_single_video(
             prompt=prompt,
             reference_image_paths=reference_image_paths,
+            aspect_ratio=str(self.render_geometry["video_aspect_ratio"]),
+            resolution=str(self.render_geometry["video_resolution"]),
             progress=progress,
         )
         return video_output
@@ -247,7 +252,9 @@ class CameraImageGenerator:
         image_output = await self.image_generator.generate_single_image(
             prompt=prompt,
             reference_image_paths=reference_image_paths,
-            size="1600x900",
+            size=str(self.render_geometry["image_size"]),
+            aspect_ratio=str(self.render_geometry["image_aspect_ratio"]),
+            allow_portrait=bool(self.render_geometry["allow_portrait"]),
         )
         return image_output
 

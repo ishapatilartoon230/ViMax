@@ -21,9 +21,11 @@ from agents.scene_extractor import SceneExtractor
 from pipelines.novel2movie_pipeline import Novel2MoviePipeline
 from pipelines.idea2video_pipeline import Idea2VideoPipeline
 from pipelines.script2video_pipeline import Script2VideoPipeline
+from tools.image_generator_nanobanana_google_api import ImageGeneratorNanobananaGoogleAPI
 from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
 from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
 from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
+from tools.video_generator_omni_google_api import VideoGeneratorOmniGoogleAPI
 from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
 
@@ -31,6 +33,7 @@ from .config import api_provider_from_base_url, embedding_api_key, embedding_bas
 from .models import ToolResult
 from .config import image_num_candidates
 from utils.image_selection import DEFAULT_IMAGE_CANDIDATES
+from utils.render_geometry import resolve_render_geometry
 from .tools import ToolArgumentSchema, ToolRuntimeContext, ToolSpec
 
 
@@ -358,10 +361,11 @@ class ViMaxAdapters:
             image_generator = _build_image_generator()
             video_generator = _build_video_generator()
             num_image_candidates = image_num_candidates(self.workspace_root)
+            render_geometry = resolve_render_geometry(self.workspace_root)
             if runtime:
                 runtime.emit_progress("Starting video render", stage="rendering", metadata={"session_id": session_id})
             if _idea_mode_ready(checklist):
-                idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "idea2video"), num_image_candidates=num_image_candidates)
+                idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "idea2video"), num_image_candidates=num_image_candidates, render_geometry=render_geometry)
                 with _suppress_pipeline_output():
                     final_video = await idea_pipeline(idea=str(session.get("idea", "")), user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), quiet=True, progress=_pipeline_progress(runtime, session_id))
                 self.session_index.update_stage(session_id, "rendered", "Final video rendered")
@@ -372,7 +376,7 @@ class ViMaxAdapters:
                 script_dir = working_dir / "script2video"
                 script_text = _load_script_text(working_dir)
                 characters = _load_characters(script_dir / "characters.json")
-                pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(script_dir), num_image_candidates=num_image_candidates)
+                pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(script_dir), num_image_candidates=num_image_candidates, render_geometry=render_geometry)
                 with _suppress_pipeline_output():
                     final_video = await pipeline(script=script_text, user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), characters=characters, quiet=True, progress=_pipeline_progress(runtime, session_id))
                 self.session_index.update_stage(session_id, "rendered", "Final video rendered")
@@ -381,7 +385,7 @@ class ViMaxAdapters:
                 return ToolResult("vimax_render_video", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
             if _novel_mode_ready(checklist):
                 novel_dir = working_dir / "novel2video"
-                pipeline = _build_novel_render_pipeline(novel_dir, chat_model, image_generator, video_generator, num_image_candidates=num_image_candidates)
+                pipeline = _build_novel_render_pipeline(novel_dir, chat_model, image_generator, video_generator, num_image_candidates=num_image_candidates, render_geometry=render_geometry)
                 with _suppress_pipeline_output():
                     render_result = await pipeline.render_video_artifacts(style=str(session.get("style", "")), user_requirement=str(session.get("user_requirement", "")), quiet=True, progress=_pipeline_progress(runtime, session_id))
                 scene_videos_dir = Path(render_result["scene_videos_dir"])
@@ -538,11 +542,13 @@ def _llm_request_timeout_seconds() -> float:
 
 
 def _narrative_max_tokens() -> int:
-    raw = os.environ.get("VIMAX_NARRATIVE_MAX_TOKENS", "4096")
+    # Thinking models (e.g. gemini-3.x flash) count reasoning toward the
+    # completion budget, so keep headroom for long structured artifacts.
+    raw = os.environ.get("VIMAX_NARRATIVE_MAX_TOKENS", "16384")
     try:
         return max(256, int(raw))
     except ValueError:
-        return 4096
+        return 16384
 
 
 def _pipeline_progress(runtime: ToolRuntimeContext | None, session_id: str, *, scene_index: int | None = None):
@@ -574,18 +580,23 @@ def _build_chat_model() -> Any:
     )
 
 
-def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGeneratorOpenRouterAPI:
+def _build_image_generator() -> ImageGeneratorNanobananaGoogleAPI | ImageGeneratorNanobananaYunwuAPI | ImageGeneratorOpenRouterAPI:
     api_key = image_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_IMAGE_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml image/llm api_key is required for image generation")
     model = image_model()
     base_url = image_base_url()
-    if api_provider_from_base_url(base_url) == "openrouter":
+    provider = api_provider_from_base_url(base_url)
+    if provider == "openrouter":
         return ImageGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url)
+    if provider in ("", "google"):
+        # Official Google Gemini API; the native client resolves the endpoint itself.
+        return ImageGeneratorNanobananaGoogleAPI(api_key=api_key, model=model)
+    # Custom google-genai compatible relay (e.g. yunwu.ai) routed through base_url.
     return ImageGeneratorNanobananaYunwuAPI(api_key=api_key, model=model, base_url=base_url)
 
 
-def _build_video_generator() -> VideoGeneratorVeoYunwuAPI | VideoGeneratorOpenRouterAPI:
+def _build_video_generator() -> VideoGeneratorOmniGoogleAPI | VideoGeneratorVeoYunwuAPI | VideoGeneratorOpenRouterAPI:
     api_key = video_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_VIDEO_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml video/llm api_key is required for video generation")
@@ -596,6 +607,10 @@ def _build_video_generator() -> VideoGeneratorVeoYunwuAPI | VideoGeneratorOpenRo
         return VideoGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url)
     if provider == "yunwu":
         return VideoGeneratorVeoYunwuAPI(api_key=api_key, t2v_model=model, ff2v_model=model, base_url=base_url)
+    if provider == "google":
+        # Official Google Gemini API; video generation runs through the
+        # Interactions API with Gemini Omni Flash (Veo previews were retired).
+        return VideoGeneratorOmniGoogleAPI(api_key=api_key, model=model)
     raise RuntimeError(f"Unsupported video base_url for automatic provider matching: {base_url}")
 
 
@@ -612,7 +627,10 @@ def _build_embedding_model() -> Any:
         raise RuntimeError("VIMAX_EMBEDDING_API_KEY or configs/agent.local.yaml embedding api_key/base_url is required for novel planning")
     if provider != "openai":
         raise RuntimeError(f"Unsupported embedding model_provider: {provider}")
-    return OpenAIEmbeddings(model=embedding_model(), api_key=api_key, base_url=base_url)
+    # check_embedding_ctx_length=False skips the tiktoken/base64 request shape
+    # that non-OpenAI compatible endpoints (e.g. the Gemini OpenAI-compat API)
+    # do not implement.
+    return OpenAIEmbeddings(model=embedding_model(), api_key=api_key, base_url=base_url, check_embedding_ctx_length=False)
 
 
 def _build_reranker() -> RerankerBgeSiliconapi:
@@ -644,13 +662,13 @@ def _build_novel_pipeline(working_dir: Path) -> Novel2MoviePipeline:
     )
 
 
-def _build_novel_render_pipeline(working_dir: Path, chat_model: Any, image_generator: Any, video_generator: Any, num_image_candidates: int = DEFAULT_IMAGE_CANDIDATES) -> Novel2MoviePipeline:
+def _build_novel_render_pipeline(working_dir: Path, chat_model: Any, image_generator: Any, video_generator: Any, num_image_candidates: int = DEFAULT_IMAGE_CANDIDATES, render_geometry: dict[str, Any] | None = None) -> Novel2MoviePipeline:
     api_key = llm_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_LLM_API_KEY or configs/agent.local.yaml llm.api_key is required for novel rendering")
     base_url = llm_base_url()
     model = llm_model()
-    script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "videos"), num_image_candidates=num_image_candidates)
+    script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "videos"), num_image_candidates=num_image_candidates, render_geometry=render_geometry)
     return Novel2MoviePipeline(
         novel_compressor=NovelCompressor(api_key=api_key, base_url=base_url, chat_model=model),
         event_extractor=EventExtractor(api_key=api_key, base_url=base_url, chat_model=model),

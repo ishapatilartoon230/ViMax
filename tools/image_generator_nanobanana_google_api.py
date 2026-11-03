@@ -19,9 +19,10 @@ class ImageGeneratorNanobananaGoogleAPI:
     def __init__(
         self,
         api_key: str,
+        model: str = "gemini-2.5-flash-image",
         rate_limiter: Optional[RateLimiter] = None,
     ):
-        self.model = "gemini-2.5-flash-image"
+        self.model = model
         self.rate_limiter = rate_limiter
         self.client = genai.Client(
             api_key=api_key,

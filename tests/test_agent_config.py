@@ -99,7 +99,30 @@ class AgentConfigTests(unittest.TestCase):
     def test_video_provider_is_inferred_from_base_url(self):
         self.assertEqual(api_provider_from_base_url("https://openrouter.ai/api/v1"), "openrouter")
         self.assertEqual(api_provider_from_base_url("https://yunwu.ai/v1"), "yunwu")
+        self.assertEqual(api_provider_from_base_url("https://generativelanguage.googleapis.com"), "google")
+        self.assertEqual(api_provider_from_base_url("https://generativelanguage.googleapis.com/v1beta/openai/"), "google")
         self.assertEqual(api_provider_from_base_url("https://example.com/v1"), "")
+
+    def test_defaults_target_google_gemini(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(llm_model(tmp), "gemini-3.8-flash")
+            self.assertEqual(llm_model_provider(tmp), "openai")
+            self.assertEqual(llm_base_url(tmp), "https://generativelanguage.googleapis.com/v1beta/openai/")
+            self.assertEqual(image_model(tmp), "gemini-3.1-flash-image")
+            self.assertEqual(image_base_url(tmp), "https://generativelanguage.googleapis.com")
+            self.assertEqual(video_model(tmp), "gemini-omni-1.1-flash")
+            self.assertEqual(video_base_url(tmp), "https://generativelanguage.googleapis.com")
+            self.assertEqual(video_provider(tmp), "google")
+            self.assertEqual(embedding_model(tmp), "gemini-embedding-001")
+            self.assertEqual(embedding_base_url(tmp), "https://generativelanguage.googleapis.com/v1beta/openai/")
+
+    def test_embedding_key_falls_back_to_llm_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / "configs"
+            config_dir.mkdir()
+            (config_dir / "agent.local.yaml").write_text(yaml.safe_dump({"llm": {"api_key": "shared-key"}}), encoding="utf-8")
+            with patch.dict(os.environ, {}, clear=True):
+                self.assertEqual(embedding_api_key(tmp), "shared-key")
 
     def test_image_candidates_default_and_environment_override(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):

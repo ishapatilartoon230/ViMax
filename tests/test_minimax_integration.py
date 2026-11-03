@@ -170,7 +170,7 @@ class TestPipelineInitFromConfig(unittest.TestCase):
 
     @patch("pipelines.idea2video_pipeline.init_chat_model")
     @patch("pipelines.idea2video_pipeline.RenderBackend.from_config")
-    def test_existing_openrouter_config_still_works(self, mock_backend, mock_init):
+    def test_existing_google_config_still_works(self, mock_backend, mock_init):
         mock_model = MagicMock()
         mock_init.return_value = mock_model
         mock_backend.return_value = MagicMock(image_generator=MagicMock(), video_generator=MagicMock())
@@ -181,7 +181,8 @@ class TestPipelineInitFromConfig(unittest.TestCase):
         mock_init.assert_called_once()
         call_kwargs = mock_init.call_args[1]
         self.assertEqual(call_kwargs["model_provider"], "openai")
-        self.assertEqual(call_kwargs["base_url"], "https://openrouter.ai/api/v1")
+        self.assertEqual(call_kwargs["base_url"], "https://generativelanguage.googleapis.com/v1beta/openai/")
+        self.assertEqual(call_kwargs["model"], "gemini-3.8-flash")
 
 
 if __name__ == "__main__":

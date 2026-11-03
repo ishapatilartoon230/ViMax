@@ -18,6 +18,7 @@ from langchain.chat_models import init_chat_model
 from tools.render_backend import RenderBackend
 from utils.provider_presets import resolve_chat_model_config
 from utils.image_selection import DEFAULT_IMAGE_CANDIDATES, image_candidate_count_from_config, validate_image_candidate_count
+from utils.render_geometry import normalize_render_geometry
 
 
 
@@ -92,18 +93,20 @@ class Script2VideoPipeline:
         video_generator,
         working_dir: str,
         num_image_candidates: int = DEFAULT_IMAGE_CANDIDATES,
+        render_geometry: Optional[Dict[str, Any]] = None,
     ):
 
         self.chat_model = chat_model
         self.image_generator = image_generator
         self.video_generator = video_generator
         self.num_image_candidates = validate_image_candidate_count(num_image_candidates)
+        self.render_geometry = normalize_render_geometry(render_geometry)
         self.best_image_selector = BestImageSelector(chat_model=self.chat_model)
 
         self.character_extractor = CharacterExtractor(chat_model=self.chat_model)
         self.character_portraits_generator = CharacterPortraitsGenerator(image_generator=self.image_generator)
         self.storyboard_artist = StoryboardArtist(chat_model=self.chat_model)
-        self.camera_image_generator = CameraImageGenerator(chat_model=self.chat_model, image_generator=self.image_generator, video_generator=self.video_generator)
+        self.camera_image_generator = CameraImageGenerator(chat_model=self.chat_model, image_generator=self.image_generator, video_generator=self.video_generator, render_geometry=self.render_geometry)
         self.reference_image_selector = ReferenceImageSelector(chat_model=self.chat_model)
 
         self.working_dir = working_dir
@@ -111,6 +114,21 @@ class Script2VideoPipeline:
         self.character_portrait_events = {}
         self.shot_desc_events = {}
         self.frame_events = {}
+
+    def _image_size(self) -> str:
+        return str(self.render_geometry["image_size"])
+
+    def _image_aspect_ratio(self) -> str:
+        return str(self.render_geometry["image_aspect_ratio"])
+
+    def _allow_portrait(self) -> bool:
+        return bool(self.render_geometry["allow_portrait"])
+
+    def _video_aspect_ratio(self) -> str:
+        return str(self.render_geometry["video_aspect_ratio"])
+
+    def _video_resolution(self) -> str:
+        return str(self.render_geometry["video_resolution"])
 
 
     async def plan_text_artifacts(
@@ -199,6 +217,7 @@ class Script2VideoPipeline:
             video_generator=backend.video_generator,
             working_dir=config["working_dir"],
             num_image_candidates=image_candidate_count_from_config(config),
+            render_geometry=config.get("render") if isinstance(config.get("render"), dict) else None,
         )
 
     async def __call__(
@@ -435,7 +454,7 @@ class Script2VideoPipeline:
                     reference_image_paths=reference_image_paths,
                     reference_image_path_and_text_pairs=reference_image_path_and_text_pairs,
                     target_description=shot_descriptions[first_shot_idx].ff_desc,
-                    size="1600x900",
+                    size=self._image_size(),
                     candidates_save_dir=os.path.join(self.working_dir, "shots", str(first_shot_idx), "first_frame_candidates"),
                     progress=_scoped_progress(progress, camera_idx=camera.idx, shot_idx=first_shot_idx, frame_type="first_frame"),
                 )
@@ -526,6 +545,8 @@ class Script2VideoPipeline:
             video_output = await self.video_generator.generate_single_video(
                 prompt=shot_description.motion_desc + "\n" + shot_description.audio_desc,
                 reference_image_paths=frame_paths,
+                aspect_ratio=self._video_aspect_ratio(),
+                resolution=self._video_resolution(),
                 progress=_scoped_progress(progress, shot_idx=shot_description.idx, artifact="video_clip"),
             )
             video_output.save(video_path)
@@ -538,15 +559,18 @@ class Script2VideoPipeline:
         reference_image_paths: List[str],
         reference_image_path_and_text_pairs: List[Tuple[str, str]],
         target_description: str,
-        size: str = "1600x900",
+        size: str | None = None,
         num_candidates: int | None = None,
         candidates_save_dir: str | None = None,
         progress: Callable[[str, str, Dict[str, Any] | None], None] | None = None,
     ) -> ImageOutput:
         count = validate_image_candidate_count(self.num_image_candidates if num_candidates is None else num_candidates)
+        if size is None:
+            size = self._image_size()
         if count == 1:
             return await self.image_generator.generate_single_image(
                 prompt=prompt, reference_image_paths=reference_image_paths, size=size,
+                aspect_ratio=self._image_aspect_ratio(), allow_portrait=self._allow_portrait(),
             )
 
         save_dir = Path(candidates_save_dir) if candidates_save_dir else Path(self.working_dir) / "image_candidates" / uuid4().hex
@@ -593,6 +617,7 @@ class Script2VideoPipeline:
                 else:
                     output = await self.image_generator.generate_single_image(
                         prompt=prompt, reference_image_paths=reference_image_paths, size=size,
+                        aspect_ratio=self._image_aspect_ratio(), allow_portrait=self._allow_portrait(),
                     )
                     if output is None:
                         raise RuntimeError("Image provider returned no image")
@@ -601,7 +626,7 @@ class Script2VideoPipeline:
                     width, height = image.size
                     output = ImageOutput(fmt="pil", ext="png", data=image.copy())
                 record.update(width=width, height=height)
-                if width <= height:
+                if width <= height and not self._allow_portrait():
                     raise ValueError("Candidate is not landscape")
                 record["status"] = "ready"
                 save_selection()
@@ -718,7 +743,7 @@ class Script2VideoPipeline:
                 reference_image_paths=reference_image_paths,
                 reference_image_path_and_text_pairs=reference_image_path_and_text_pairs,
                 target_description=frame_desc,
-                size="1600x900",
+                size=self._image_size(),
                 candidates_save_dir=os.path.join(self.working_dir, "shots", str(shot_idx), f"{frame_type}_candidates"),
                 progress=_scoped_progress(progress, shot_idx=shot_idx, frame_type=frame_type),
             )

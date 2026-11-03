@@ -8,15 +8,23 @@ from typing import Any
 import yaml
 from utils.image_selection import image_candidate_count_from_config
 
-DEFAULT_LLM_MODEL = "gpt-5.5"
+# Defaults target the official Google Gemini API (https://ai.google.dev/gemini-api/docs/openai)
+# so a single Google AI Studio API key drives the LLM, image, video, and embedding services.
+# Alternative gateways (yunwu.ai, OpenRouter) remain available via configs/agent.local.yaml or VIMAX_* env vars.
+GOOGLE_API_BASE_URL = "https://generativelanguage.googleapis.com"
+GOOGLE_OPENAI_COMPAT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+DEFAULT_LLM_MODEL = "gemini-3.8-flash"
 DEFAULT_LLM_MODEL_PROVIDER = "openai"
-DEFAULT_LLM_BASE_URL = "https://yunwu.ai/v1"
-DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image-preview"
-DEFAULT_IMAGE_BASE_URL = "https://yunwu.ai"
-DEFAULT_VIDEO_MODEL = "veo3.1-fast"
-DEFAULT_VIDEO_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
+DEFAULT_LLM_BASE_URL = GOOGLE_OPENAI_COMPAT_BASE_URL
+DEFAULT_IMAGE_MODEL = "gemini-3.1-flash-image"
+DEFAULT_IMAGE_BASE_URL = GOOGLE_API_BASE_URL
+# Veo preview models were shut down on the Gemini API (2026-10-22);
+# video generation now runs through the Interactions API with Omni Flash.
+DEFAULT_VIDEO_MODEL = "gemini-omni-1.1-flash"
+DEFAULT_VIDEO_BASE_URL = GOOGLE_API_BASE_URL
+DEFAULT_EMBEDDING_MODEL = "gemini-embedding-001"
 DEFAULT_EMBEDDING_MODEL_PROVIDER = "openai"
+DEFAULT_EMBEDDING_BASE_URL = GOOGLE_OPENAI_COMPAT_BASE_URL
 DEFAULT_RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 
 
@@ -89,11 +97,11 @@ def embedding_model_provider(workspace_root: str | Path = ".") -> str:
 
 
 def embedding_base_url(workspace_root: str | Path = ".") -> str:
-    return config_value("embedding", "base_url", ["VIMAX_EMBEDDING_BASE_URL"], "", workspace_root)
+    return config_value("embedding", "base_url", ["VIMAX_EMBEDDING_BASE_URL"], DEFAULT_EMBEDDING_BASE_URL, workspace_root)
 
 
 def embedding_api_key(workspace_root: str | Path = ".") -> str:
-    return config_value("embedding", "api_key", ["VIMAX_EMBEDDING_API_KEY"], "", workspace_root)
+    return config_value("embedding", "api_key", ["VIMAX_EMBEDDING_API_KEY", "VIMAX_LLM_API_KEY"], llm_api_key(workspace_root), workspace_root)
 
 
 def reranker_model(workspace_root: str | Path = ".") -> str:
@@ -126,6 +134,8 @@ def api_provider_from_base_url(base_url: str) -> str:
         return "openrouter"
     if "yunwu.ai" in normalized:
         return "yunwu"
+    if "generativelanguage.googleapis.com" in normalized:
+        return "google"
     return ""
 
 

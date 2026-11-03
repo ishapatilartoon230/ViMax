@@ -172,7 +172,12 @@ def _transition(src: str, dst: str, reason: str) -> dict[str, str]:
 
 
 def _openai_tool_call(call: ToolCall) -> dict[str, Any]:
-    return {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)}}
+    payload: dict[str, Any] = {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)}}
+    if call.thought_signature:
+        # Gemini thinking models attach a thought signature to function calls;
+        # replaying the call without it is rejected with HTTP 400.
+        payload["extra_content"] = {"google": {"thought_signature": call.thought_signature}}
+    return payload
 
 
 def build_runtime(workspace_root: str | Path = ".", llm: Any | None = None, adapter_specs: list[Any] | None = None) -> AgentLoop:
