@@ -83,6 +83,7 @@ class EventExtractor:
         api_key: str,
         base_url: str,
         chat_model: str,
+        novel_skills: str = "",
     ):
         self.chat_model = init_chat_model(
             model=chat_model,
@@ -91,6 +92,10 @@ class EventExtractor:
             base_url=base_url,
         )
         self.parser = PydanticOutputParser(pydantic_object=Event)
+        self.novel_skills = (novel_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n{self.novel_skills}" if self.novel_skills else ""
 
 
     # Cap on extracted events: is_last is asserted by the LLM only, so without a
@@ -134,7 +139,7 @@ class EventExtractor:
 
         messages = [
             SystemMessage(
-                content=system_prompt_template_extract_events.format(format_instructions=self.parser.get_format_instructions()),
+                content=system_prompt_template_extract_events.format(format_instructions=self.parser.get_format_instructions()) + self._skill_suffix(),
             ),
             HumanMessage(
                 content=human_prompt_template_extract_next_event.format(

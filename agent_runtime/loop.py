@@ -17,6 +17,20 @@ from .tools import ToolRegistry, build_builtin_registry
 MAX_TOOL_PASSES = 50
 
 
+def _is_context_limit_error(exc: BaseException) -> bool:
+    """Provider 'input too large' errors: retryable only after compaction."""
+    text = str(exc).lower()
+    markers = (
+        "exceeds the maximum number of tokens",
+        "input token count exceeds",
+        "context length exceeded",
+        "contextwindowexceeded",
+        "maximum context length",
+        "too many input tokens",
+    )
+    return any(marker in text for marker in markers)
+
+
 class AgentLoop:
     def __init__(self, session_index: SessionIndex, prompt_builder: PromptBuilder, tool_registry: ToolRegistry, tool_executor: ToolExecutor, llm: Any, context_compactor: ContextCompactor | None = None) -> None:
         self.session_index = session_index
@@ -39,6 +53,23 @@ class AgentLoop:
         self.history = [self.context_compactor.synthetic_summary_message(result.summary), *result.preserved_messages]
         self.session_index.update_compaction(session["session_id"], _compaction_record(result))
         return f"Compacted context {result.estimated_tokens_before} -> {result.estimated_tokens_after} ({result.mode})."
+
+    async def _compact_runtime_messages(self, runtime_messages: list[dict[str, Any]], system: str, *, reason: str) -> list[dict[str, Any]]:
+        """Compact the live turn's message list in place of failing it.
+
+        Summarizes the conversation so far (keeping the system prompt and the
+        most recent messages) so sampling can continue after token pressure
+        instead of the provider rejecting the input outright.
+        """
+        session = self.session_index.active() or self.session_index.create()
+        result = await self.context_compactor.compact(
+            runtime_messages,
+            previous_summary=str(session.get("compacted_summary", "") or ""),
+            reason=reason,
+        )
+        self.session_index.update_compaction(session["session_id"], _compaction_record(result))
+        preserved = [message for message in result.preserved_messages if message.get("role") != "system"]
+        return [{"role": "system", "content": system}, self.context_compactor.synthetic_summary_message(result.summary), *preserved]
 
     async def stream_events(self, user_input: str) -> AsyncIterator[dict[str, Any]]:
         control = TurnControl()
@@ -64,12 +95,31 @@ class AgentLoop:
         final_text = ""
         status = "completed"
         tool_round = 0
+        context_recovered = False
 
         while True:
+            # Mid-turn pressure check: compaction only at turn start lets a
+            # long tool loop grow the context past the model's input limit and
+            # hard-fail the turn with a 400. Compact between tool rounds too.
+            if tool_round > 0 and self.context_compactor.should_preflight_compact(runtime_messages, system_tokens=_prompt_tokens(parts), tools_tokens=_tool_schema_tokens(tool_schemas)):
+                yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Compacting context mid-turn"}
+                runtime_messages = await self._compact_runtime_messages(runtime_messages, system, reason="mid-turn-token-pressure")
+
             yield {"type": "status", "turn_id": control.turn_id, "phase": "sampling_assistant", "message": "Sampling assistant"}
             try:
                 assistant = await self.llm.complete(runtime_messages, tools=tool_schemas)
             except Exception as exc:
+                if _is_context_limit_error(exc) and not context_recovered:
+                    # The provider refused the input as too large: compact this
+                    # turn's runtime messages once and retry sampling instead of
+                    # failing the whole turn.
+                    context_recovered = True
+                    yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Context limit hit; compacting and retrying"}
+                    try:
+                        runtime_messages = await self._compact_runtime_messages(runtime_messages, system, reason="context-limit-recovery")
+                        continue
+                    except Exception:
+                        pass
                 status = "failed"
                 final_text = f"Agent LLM request failed: {exc}"
                 transitions.append(_transition("sampling_assistant", "finalizing_answer", "llm_sampling_failed"))
@@ -172,7 +222,12 @@ def _transition(src: str, dst: str, reason: str) -> dict[str, str]:
 
 
 def _openai_tool_call(call: ToolCall) -> dict[str, Any]:
-    return {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)}}
+    payload: dict[str, Any] = {"id": call.id, "type": "function", "function": {"name": call.name, "arguments": json.dumps(call.arguments, ensure_ascii=False)}}
+    if call.thought_signature:
+        # Gemini thinking models attach a thought signature to function calls;
+        # replaying the call without it is rejected with HTTP 400.
+        payload["extra_content"] = {"google": {"thought_signature": call.thought_signature}}
+    return payload
 
 
 def build_runtime(workspace_root: str | Path = ".", llm: Any | None = None, adapter_specs: list[Any] | None = None) -> AgentLoop:

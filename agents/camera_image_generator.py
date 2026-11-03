@@ -11,6 +11,7 @@ from scenedetect import open_video, SceneManager, split_video_ffmpeg
 from scenedetect.detectors import ContentDetector
 
 from interfaces import ShotDescription, ShotBriefDescription, Camera, ImageOutput, VideoOutput
+from utils.render_geometry import normalize_render_geometry
 
 
 from moviepy import VideoFileClip
@@ -113,10 +114,17 @@ class CameraImageGenerator:
         chat_model,
         image_generator,
         video_generator,
+        render_geometry: Optional[dict] = None,
+        frame_prompt_skills: str = "",
     ):
         self.chat_model = chat_model
         self.image_generator = image_generator
         self.video_generator = video_generator
+        self.render_geometry = normalize_render_geometry(render_geometry)
+        self.frame_prompt_skills = (frame_prompt_skills or "").strip()
+
+    def _skill_prefix(self) -> str:
+        return f"{self.frame_prompt_skills}\n---\n" if self.frame_prompt_skills else ""
 
 
     async def construct_camera_tree(
@@ -189,13 +197,16 @@ class CameraImageGenerator:
         progress=None,
     ) -> VideoOutput:
 
-        prompt = f"Two shots. The transition between the shots is a cut to. The style of the two shots should be consistent."
+        prompt = self._skill_prefix()
+        prompt += f"Two shots. The transition between the shots is a cut to. The style of the two shots should be consistent."
         prompt += f"\nThe first shot description: {first_shot_visual_desc}."
         prompt += f"\nThe second shot description: {second_shot_visual_desc}."
         reference_image_paths = [first_shot_ff_path]
         video_output = await self.video_generator.generate_single_video(
             prompt=prompt,
             reference_image_paths=reference_image_paths,
+            aspect_ratio=str(self.render_geometry["video_aspect_ratio"]),
+            resolution=str(self.render_geometry["video_resolution"]),
             progress=progress,
         )
         return video_output
@@ -238,7 +249,7 @@ class CameraImageGenerator:
         shot_desc: ShotDescription,
         character_portrait_path_and_text_pairs: List[Tuple[str, str]],
     ) -> ImageOutput:
-        prompt = ""
+        prompt = self._skill_prefix()
         reference_image_paths = []
         for i,(path, text )in enumerate(character_portrait_path_and_text_pairs):
             prompt += f"Image {i}: {text}\n"
@@ -247,7 +258,9 @@ class CameraImageGenerator:
         image_output = await self.image_generator.generate_single_image(
             prompt=prompt,
             reference_image_paths=reference_image_paths,
-            size="1600x900",
+            size=str(self.render_geometry["image_size"]),
+            aspect_ratio=str(self.render_geometry["image_aspect_ratio"]),
+            allow_portrait=bool(self.render_geometry["allow_portrait"]),
         )
         return image_output
 

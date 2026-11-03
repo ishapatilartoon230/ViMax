@@ -85,6 +85,7 @@ class NovelCompressor:
         chat_model: str,
         chunk_size: int = 65536,
         chunk_overlap: int = 8192,
+        novel_skills: str = "",
     ):
         self.chat_model = init_chat_model(
             model=chat_model,
@@ -92,6 +93,10 @@ class NovelCompressor:
             base_url=base_url,
             model_provider="openai",
         )
+        self.novel_skills = (novel_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n{self.novel_skills}" if self.novel_skills else ""
 
         self.splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_size,
@@ -132,7 +137,7 @@ class NovelCompressor:
             logging.info(f"Compressing novel chunk {index}")
             messages = [
                 SystemMessage(
-                    content=system_prompt_template_compress_novel_chunk
+                    content=system_prompt_template_compress_novel_chunk + self._skill_suffix()
                 ),
                 HumanMessage(
                     content=human_prompt_template_compress_novel_chunk.format(
@@ -157,7 +162,7 @@ class NovelCompressor:
 
         messages = [
             SystemMessage(
-                content=system_prompt_template_aggregate
+                content=system_prompt_template_aggregate + self._skill_suffix()
             ),
             HumanMessage(
                 content=human_prompt_template_aggregate.format(

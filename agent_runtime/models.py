@@ -12,6 +12,10 @@ class ToolCall:
     name: str
     arguments: dict[str, Any] = field(default_factory=dict)
     id: str = field(default_factory=lambda: f"tool-{uuid4().hex[:12]}")
+    # Provider reasoning signature attached to function calls by thinking
+    # models (e.g. Gemini thought_signature). Deliberately omitted from
+    # as_dict() so opaque signature blobs never enter JSONL logs or history.
+    thought_signature: str = field(default="", repr=False)
 
     def as_dict(self) -> dict[str, Any]:
         return {"id": self.id, "name": self.name, "arguments": self.arguments}

@@ -140,9 +140,14 @@ class ReferenceImageSelector:
     def __init__(
         self,
         chat_model,
+        reference_skills: str = "",
     ):
 
         self.chat_model = chat_model
+        self.reference_skills = (reference_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n{self.reference_skills}" if self.reference_skills else ""
 
 
     @retry(
@@ -171,7 +176,7 @@ class ReferenceImageSelector:
             parser = PydanticOutputParser(pydantic_object=RefImageIndicesAndTextPrompt)
 
             messages = [
-                SystemMessage(content=system_prompt_template_select_reference_images_only_text.format(format_instructions=parser.get_format_instructions())),
+                SystemMessage(content=system_prompt_template_select_reference_images_only_text.format(format_instructions=parser.get_format_instructions()) + self._skill_suffix()),
                 HumanMessage(content=human_content)
             ]
 
@@ -205,7 +210,7 @@ class ReferenceImageSelector:
         parser = PydanticOutputParser(pydantic_object=RefImageIndicesAndTextPrompt)
 
         messages = [
-            SystemMessage(content=system_prompt_template_select_reference_images_multimodal.format(format_instructions=parser.get_format_instructions())),
+            SystemMessage(content=system_prompt_template_select_reference_images_multimodal.format(format_instructions=parser.get_format_instructions()) + self._skill_suffix()),
             HumanMessage(content=human_content)
         ]
 

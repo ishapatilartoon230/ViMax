@@ -17,6 +17,39 @@ from agents.global_information_planner import GlobalInformationPlanner, MergeCha
 from pipelines.novel2movie_pipeline import Novel2MoviePipeline
 
 
+def setUpModule():
+    """Hermetic tests: no test in this module may reach a real LLM via the
+    project's own configs.
+
+    ``llm_api_key``/``llm_base_url`` fall back to
+    ``configs/agent.local.yaml`` resolved from the CURRENT WORKING DIRECTORY
+    (workspace_root=".") — the real project file. If the user edits that file
+    while tests run, unmocked intake paths would silently make live API
+    calls. Neutralize only that project-cwd YAML fallback here; environment
+    variables and per-test tmp workspace configs keep working.
+    """
+    import agent_runtime.config as cfg
+    from pathlib import Path as _Path
+
+    _project_root = _Path(__file__).resolve().parent.parent
+    _original_load = cfg.load_agent_config
+
+    def _hermetic_load(workspace_root: str | Path = "."):
+        resolved = _Path(workspace_root).resolve() / "configs" / "agent.local.yaml"
+        if resolved == _project_root / "configs" / "agent.local.yaml":
+            return {}
+        return _original_load(workspace_root)
+
+    _patcher = patch.object(cfg, "load_agent_config", _hermetic_load)
+    _patcher.start()
+    globals()["_KEY_PATCHER"] = _patcher
+
+
+def tearDownModule():
+    globals().pop("_KEY_PATCHER", None).stop()
+
+
+
 class FakeCompressor:
     def split(self, novel_text):
         return [novel_text]
@@ -220,7 +253,7 @@ class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
             index = SessionIndex(tmp)
             empty = index.create(project_name="Novel draft")
             adapter = ViMaxAdapters(Path(tmp), index)
-            with patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir: FakeNovelPipeline(Path(working_dir))):
+            with patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir, skills=None: FakeNovelPipeline(Path(working_dir))):
                 result = await adapter.vimax_novel_planning({"novel_text": "Hero opens a door."})
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -245,7 +278,7 @@ class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
             adapter = ViMaxAdapters(Path(tmp), index)
             progress_events = []
             runtime = ToolRuntimeContext("vimax_novel_planning", "vimax_novel_planning", turn_id="turn-test", progress_callback=progress_events.append)
-            with patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir: FakeNovelPipeline(Path(working_dir))):
+            with patch("agent_runtime.vimax_adapters._build_novel_pipeline", side_effect=lambda working_dir, skills=None: FakeNovelPipeline(Path(working_dir))):
                 result = await adapter.vimax_novel_planning({"novel_text": "Hero opens a door.", "style": "noir"}, runtime)
             self.assertTrue(result.ok)
             payload = json.loads(result.content)
@@ -272,7 +305,7 @@ class NovelAdapterTests(unittest.IsolatedAsyncioTestCase):
                  patch("agent_runtime.vimax_adapters._build_chat_model", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_image_generator", return_value=object()), \
                  patch("agent_runtime.vimax_adapters._build_video_generator", return_value=object()), \
-                 patch("agent_runtime.vimax_adapters._build_novel_render_pipeline", side_effect=lambda working_dir, chat_model, image_generator, video_generator, num_image_candidates=2: FakeNovelRenderPipeline(Path(working_dir))) as factory:
+                 patch("agent_runtime.vimax_adapters._build_novel_render_pipeline", side_effect=lambda working_dir, chat_model, image_generator, video_generator, num_image_candidates=2, render_geometry=None, skills=None, review_config=None, review_chat_model=None: FakeNovelRenderPipeline(Path(working_dir))) as factory:
                 result = await adapter.vimax_render_video({}, runtime)
             self.assertTrue(result.ok)
             self.assertEqual(factory.call_args.kwargs["num_image_candidates"], 3)

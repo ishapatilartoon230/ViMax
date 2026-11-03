@@ -1,5 +1,4 @@
 import logging
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from utils.robust_json_parser import TrailingCommaTolerantPydanticOutputParser as PydanticOutputParser
 from langchain.chat_models import init_chat_model
@@ -78,6 +77,7 @@ class ScriptEnhancer:
         base_url: str,
         api_key: str,
         model_provider: str = "openai",
+        enhancement_skills: str = "",
     ):
         self.chat_model = init_chat_model(
             model=chat_model,
@@ -85,6 +85,10 @@ class ScriptEnhancer:
             base_url=base_url,
             api_key=api_key,
         )
+        self.enhancement_skills = (enhancement_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n[Project Skills]\n{self.enhancement_skills}" if self.enhancement_skills else ""
 
     @retry(
         stop=stop_after_attempt(3),
@@ -98,22 +102,15 @@ class ScriptEnhancer:
         Enhance a planned script with more concrete detail and continuity polish.
         """
         parser = PydanticOutputParser(pydantic_object=EnhancedScriptResponse)
-        prompt_template = ChatPromptTemplate.from_messages(
-            [
-                ("system", system_prompt_template_script_enhancer),
-                ("human", human_prompt_template_script_enhancer),
-            ]
-        )
-        chain = prompt_template | self.chat_model | parser
+        messages = [
+            ("system", system_prompt_template_script_enhancer.format(format_instructions=parser.get_format_instructions()) + self._skill_suffix()),
+            ("human", human_prompt_template_script_enhancer.format(planned_script=planned_script)),
+        ]
+        chain = self.chat_model | parser
 
         try:
             logging.info("Enhancing planned script...")
-            response: EnhancedScriptResponse = await chain.ainvoke(
-                {
-                    "format_instructions": parser.get_format_instructions(),
-                    "planned_script": planned_script,
-                }
-            )
+            response: EnhancedScriptResponse = await chain.ainvoke(messages)
             logging.info("Script enhancement completed.")
             return response.enhanced_script
         except Exception as e:

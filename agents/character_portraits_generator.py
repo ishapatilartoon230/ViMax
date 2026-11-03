@@ -34,8 +34,13 @@ class CharacterPortraitsGenerator:
     def __init__(
         self,
         image_generator,
+        portrait_skills: str = "",
     ):
         self.image_generator = image_generator
+        self.portrait_skills = (portrait_skills or "").strip()
+
+    def _skill_prefix(self) -> str:
+        return f"{self.portrait_skills}\n---\n" if self.portrait_skills else ""
 
 
     async def generate_front_portrait(
@@ -44,7 +49,7 @@ class CharacterPortraitsGenerator:
         style: str,
     ) -> ImageOutput:
         features = "(static) " + (character.static_features or "") + "; (dynamic) " + (character.dynamic_features or "")
-        prompt = prompt_template_front.format(
+        prompt = self._skill_prefix() + prompt_template_front.format(
             identifier=character.identifier_in_scene,
             features=features,
             style=style,
@@ -60,7 +65,7 @@ class CharacterPortraitsGenerator:
         character: CharacterInScene,
         front_image_path: str,
     ) -> ImageOutput:
-        prompt = prompt_template_side.format(
+        prompt = self._skill_prefix() + prompt_template_side.format(
             identifier=character.identifier_in_scene,
         )
         image_output = await self.image_generator.generate_single_image(
@@ -76,7 +81,7 @@ class CharacterPortraitsGenerator:
         character: CharacterInScene,
         front_image_path: str,
     ) -> ImageOutput:
-        prompt = prompt_template_back.format(
+        prompt = self._skill_prefix() + prompt_template_back.format(
             identifier=character.identifier_in_scene,
         )
         image_output = await self.image_generator.generate_single_image(

@@ -247,7 +247,12 @@ function App() {
 
   useEffect(() => {
     const {command, args} = agentCommand();
-    const child = spawn(command, args, {cwd: repoRoot, env: process.env});
+    const child = spawn(command, args, {
+      cwd: repoRoot,
+      // Windows children default to the legacy code page; the agent emits
+      // UTF-8 (emoji included), so force Python's streams to UTF-8.
+      env: {...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8'},
+    });
     childRef.current = child;
 
     child.stdout.setEncoding('utf8');

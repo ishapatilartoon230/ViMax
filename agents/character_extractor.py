@@ -45,6 +45,7 @@ Her finger traces the rim of the ceramic mug, following the imperfect circle ove
 - Don't include any information about the character's personality, role, or relationships with others in either static or dynamic features.
 - When designing character features, within reasonable limits, different character appearances should be made more distinct from each other.
 - The description of characters should be detailed, avoiding the use of abstract terms. Instead, employ descriptions that can be visualized—such as specific clothing colors and concrete physical traits (e.g., large eyes, a high nose bridge).
+- When the script describes how a character SOUNDS (voice continuity/lock sections, e.g. "her voice is warm, slightly husky, with a subtle accent"), copy that voice identity into the character's voice_features field: gender/age feel, pitch, accent, timbre, and speaking rhythm, in the script's own words where possible. Never invent a voice the script did not describe — leave voice_features empty instead. Delivery emotions for individual lines (e.g. "playful confidence") are NOT voice identity; do not put them in voice_features.
 """
 
 human_prompt_template_extract_characters = \
@@ -66,8 +67,13 @@ class CharacterExtractor:
     def __init__(
         self,
         chat_model,
+        extraction_skills: str = "",
     ):
         self.chat_model = chat_model
+        self.extraction_skills = (extraction_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n{self.extraction_skills}" if self.extraction_skills else ""
 
     @retry(
         stop=stop_after_attempt(3),
@@ -78,7 +84,7 @@ class CharacterExtractor:
         parser = PydanticOutputParser(pydantic_object=ExtractCharactersResponse)
         
         messages = [
-            SystemMessage(content=system_prompt_template_extract_characters.format(format_instructions=parser.get_format_instructions())),
+            SystemMessage(content=system_prompt_template_extract_characters.format(format_instructions=parser.get_format_instructions()) + self._skill_suffix()),
             HumanMessage(content=human_prompt_template_extract_characters.format(script=script)),
         ]
 

@@ -151,7 +151,9 @@ async function startAgent({newSession, sessionId, projectName = ''}) {
   activeSessionId = sessionId;
   const child = spawn(command, [...args, 'main_agent.py', '--jsonl', '--stdin-repl', ...sessionArgs], {
     cwd: repoRoot,
-    env: process.env,
+    // Windows children default to the legacy code page; the agent emits UTF-8
+    // (emoji included), so force Python's streams to UTF-8.
+    env: {...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8'},
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   agentProcess = child;

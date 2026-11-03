@@ -6,7 +6,9 @@ missing exception) rather than hanging the suite; the fixed code must give up
 before the fake ever succeeds.
 """
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import requests
@@ -72,8 +74,8 @@ class TestDownloadRetries(unittest.TestCase):
             captured.update(kwargs)
             return MagicMock()
 
-        with patch("utils.image.requests.get", side_effect=record_get):
-            download_image("http://example.com/a.png", "/tmp/a.png")
+        with tempfile.TemporaryDirectory() as tmp, patch("utils.image.requests.get", side_effect=record_get):
+            download_image("http://example.com/a.png", str(Path(tmp) / "a.png"))
         self.assertIsNotNone(captured.get("timeout"), "requests.get must not wait forever")
 
     def test_download_video_gives_up_on_persistent_network_error(self):

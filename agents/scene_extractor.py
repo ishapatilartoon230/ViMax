@@ -65,6 +65,7 @@ class SceneExtractor:
         api_key,
         base_url,
         chat_model,
+        novel_skills: str = "",
     ):
         self.chat_model = init_chat_model(
             model=chat_model,
@@ -72,6 +73,10 @@ class SceneExtractor:
             base_url=base_url,
             model_provider="openai",
         )
+        self.novel_skills = (novel_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n{self.novel_skills}" if self.novel_skills else ""
 
     @retry(
         stop=stop_after_attempt(5),
@@ -94,7 +99,7 @@ class SceneExtractor:
             SystemMessage(
                 content=system_prompt_template_get_next_scene.format(
                     format_instructions=parser.get_format_instructions(),
-                ),
+                ) + self._skill_suffix(),
             ),
             HumanMessage(
                 content=human_prompt_template_get_next_scene.format(

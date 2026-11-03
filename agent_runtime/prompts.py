@@ -25,6 +25,7 @@ class PromptBuilder:
         return [
             PromptPart("agent.core", "Agent", self._read_prompt("agent.md"), "stable", "agent", True),
             PromptPart("workflow.core", "Workflow", self._read_prompt("workflow.md"), "stable", "workflow", True),
+            PromptPart("skills.agent", "Project Skills", self.project_skills_context(), "stable", "skills", True),
             PromptPart("tool.manifest", "Tools", self.tool_manifest_context(), "dynamic", "tooling"),
             PromptPart("session.context", "Session", self.workflow_context(), "dynamic", "session"),
             PromptPart("memory.preferences", "Memory", self.memory_context(), "dynamic", "memory"),
@@ -51,6 +52,12 @@ class PromptBuilder:
                 totals["compacted_summary_tokens"] += estimated
         totals["total_tokens"] = totals["stable_tokens"] + totals["dynamic_tokens"]
         return {"segments": segments, "total_estimated_tokens": totals["total_tokens"], "totals": totals}
+
+    def project_skills_context(self) -> str:
+        from utils.skills import StageSkills
+
+        block = StageSkills(self.prompt_dir.parent).stage("agent")
+        return block or ""
 
     def workflow_context(self) -> str:
         snapshot = self.session_index.snapshot()

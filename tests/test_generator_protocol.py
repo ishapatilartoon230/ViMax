@@ -6,6 +6,7 @@ import inspect
 import unittest
 
 from tools.video_generator_doubao_seedance_yunwu_api import VideoGeneratorDoubaoSeedanceYunwuAPI
+from tools.video_generator_omni_google_api import VideoGeneratorOmniGoogleAPI
 from tools.video_generator_omni_yunwu_api import VideoGeneratorOmniYunwuAPI
 from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from tools.video_generator_veo_google_api import VideoGeneratorVeoGoogleAPI
@@ -15,6 +16,7 @@ from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
 class TestVideoGeneratorProtocol(unittest.TestCase):
     GENERATORS = [
         VideoGeneratorDoubaoSeedanceYunwuAPI,
+        VideoGeneratorOmniGoogleAPI,
         VideoGeneratorOmniYunwuAPI,
         VideoGeneratorOpenRouterAPI,
         VideoGeneratorVeoGoogleAPI,

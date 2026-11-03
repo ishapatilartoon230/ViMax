@@ -11,14 +11,48 @@ from unittest.mock import patch
 from interfaces import Camera, CharacterInScene, ShotBriefDescription, ShotDescription
 from agent_runtime.session_index import SessionIndex
 from agent_runtime.vimax_adapters import ViMaxAdapters
+
+
+def setUpModule():
+    """Hermetic tests: no test in this module may reach a real LLM via the
+    project's own configs.
+
+    ``llm_api_key``/``llm_base_url`` fall back to
+    ``configs/agent.local.yaml`` resolved from the CURRENT WORKING DIRECTORY
+    (workspace_root=".") — the real project file. If the user edits that file
+    while tests run, unmocked intake paths would silently make live API
+    calls. Neutralize only that project-cwd YAML fallback here; environment
+    variables and per-test tmp workspace configs keep working.
+    """
+    import agent_runtime.config as cfg
+    from pathlib import Path as _Path
+
+    _project_root = _Path(__file__).resolve().parent.parent
+    _original_load = cfg.load_agent_config
+
+    def _hermetic_load(workspace_root: str | Path = "."):
+        resolved = _Path(workspace_root).resolve() / "configs" / "agent.local.yaml"
+        if resolved == _project_root / "configs" / "agent.local.yaml":
+            return {}
+        return _original_load(workspace_root)
+
+    _patcher = patch.object(cfg, "load_agent_config", _hermetic_load)
+    _patcher.start()
+    globals()["_KEY_PATCHER"] = _patcher
+
+
+def tearDownModule():
+    globals().pop("_KEY_PATCHER", None).stop()
+
 from agent_runtime.tools import ToolRuntimeContext
 from pipelines.idea2video_pipeline import Idea2VideoPipeline
 from pipelines.script2video_pipeline import Script2VideoPipeline
 
 
 class FakeIdeaPipeline:
-    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2):
+    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2, render_geometry=None, skills=None, review_config=None, review_chat_model=None):
         self.num_image_candidates = num_image_candidates
+        self.render_geometry = render_geometry
         self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
@@ -71,8 +105,9 @@ class NoisyRenderIdeaPipeline(FakeIdeaPipeline):
 
 
 class FakeScriptPipeline:
-    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2):
+    def __init__(self, chat_model, image_generator, video_generator, working_dir, num_image_candidates=2, render_geometry=None, skills=None, review_config=None, review_chat_model=None):
         self.num_image_candidates = num_image_candidates
+        self.render_geometry = render_geometry
         self.working_dir = Path(working_dir)
         self.working_dir.mkdir(parents=True, exist_ok=True)
 
@@ -132,7 +167,7 @@ class Script2VideoPlanningProgressTests(unittest.IsolatedAsyncioTestCase):
             pipeline.construct_camera_tree = construct_camera_tree
             events = []
             await pipeline.plan_text_artifacts("script", "req", "style", characters=chars, progress=lambda stage, message, metadata=None: events.append(stage))
-            self.assertEqual(events, ["extract_characters", "design_storyboard", "decompose_shots", "construct_camera_tree"])
+            self.assertEqual(events, ["extract_characters", "design_storyboard", "duration_budget", "decompose_shots", "construct_camera_tree"])
 
 
     async def test_idea_pipeline_quiet_suppresses_text_planning_prints(self):

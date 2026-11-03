@@ -7,6 +7,15 @@ import sys
 from typing import Any, Iterable
 from uuid import uuid4
 
+# Windows pipes default to the legacy code page (cp1252/"charmap"), which
+# cannot encode the emoji pipeline progress strings contain. Force UTF-8 on
+# both streams so a turn never dies with UnicodeEncodeError mid-print.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):  # non-TextIO or already-closed stream
+        pass
+
 ORIGINAL_STDOUT = sys.stdout
 
 

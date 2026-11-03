@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import threading
 from contextlib import contextmanager
 from datetime import datetime
 from functools import wraps
@@ -14,6 +15,22 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None
+
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - non-Windows platforms
+    msvcrt = None
+
+_PATH_LOCKS: dict[str, "threading.RLock"] = {}
+_LOCK_DEPTH = threading.local()
+
+
+def _path_lock(key: str) -> threading.RLock:
+    lock = _PATH_LOCKS.get(key)
+    if lock is None:
+        lock = threading.RLock()
+        _PATH_LOCKS[key] = lock
+    return lock
 
 
 STALE_KEYS = ["story", "characters", "script", "storyboard", "shot_descriptions", "camera_tree", "frames", "clips", "final_video"]
@@ -53,17 +70,50 @@ class SessionIndex:
 
     @contextmanager
     def _locked(self):
-        if fcntl is None:
-            yield
-            return
-        lock_path = self.vimax_dir / "sessions.lock"
-        with open(lock_path, "a+", encoding="utf-8") as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle, fcntl.LOCK_UN)
+        """Serialize index access across threads and processes.
 
+        Layer 1: a per-directory ``threading.RLock`` — on Windows there is no
+        ``fcntl``, and without an in-process lock concurrent mutators race
+        load-modify-save cycles and drop updates.
+        Layer 2: an OS file lock (``fcntl.flock`` / ``msvcrt.locking``) for
+        cross-process safety, taken only at the outermost nesting level so
+        decorated methods can call each other without deadlocking.
+        """
+        key = str(self.vimax_dir)
+        with _path_lock(key):
+            depth = getattr(_LOCK_DEPTH, "depth", 0)
+            if depth > 0:
+                _LOCK_DEPTH.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    _LOCK_DEPTH.depth = depth
+                return
+            _LOCK_DEPTH.depth = 1
+            try:
+                lock_path = self.vimax_dir / "sessions.lock"
+                if fcntl is not None:
+                    with open(lock_path, "a+", encoding="utf-8") as handle:
+                        fcntl.flock(handle, fcntl.LOCK_EX)
+                        try:
+                            yield
+                        finally:
+                            fcntl.flock(handle, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    with open(lock_path, "a+", encoding="utf-8") as handle:
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                        try:
+                            yield
+                        finally:
+                            handle.seek(0)
+                            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover - no OS file lock available
+                    yield
+            finally:
+                _LOCK_DEPTH.depth = 0
+
+    @_synchronized
     def load(self) -> dict[str, Any]:
         try:
             return json.loads(self.sessions_path.read_text(encoding="utf-8"))
@@ -81,6 +131,7 @@ class SessionIndex:
                 logging.error("sessions.json is corrupt and could not be backed up; starting with empty state")
             return {"active_session_id": "", "sessions": {}}
 
+    @_synchronized
     def save(self, data: dict[str, Any]) -> None:
         tmp_path = self.sessions_path.with_name("sessions.json.tmp")
         tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

@@ -37,6 +37,13 @@ class ShotBriefDescription(BaseModel):
         ],
     )
 
+    # timing
+    duration_seconds: Optional[float] = Field(
+        default=None,
+        description="The duration of this shot in seconds, copied from the script's explicit timing (e.g. 'Duration: 3 seconds' or a 0:00-0:03 range). Omit (null) when the script gives no per-shot timing; the pipeline-wide default then applies.",
+        examples=[3.0, 4.0, None],
+    )
+
     # sound_effect: Optional[str] = Field(
     #     default=None,
     #     description="The sound effects used in the shot.",
@@ -153,6 +160,14 @@ class ShotDescription(BaseModel):
         description='''The motion description of the shot.
         If there is a conversation, please write down the content of the conversation), when you meet some dialogue, you should write into the visual content description with :" " symbols and the character's features (eg. SLING (male, late 20s, Texan accent softened by military precision, confident and energetic.) says: "Gear retracted. Flaps transitioning. Flight path stable. You are clear to climb."). If there is a narration, you should write into the visual content description with :" " symbols and the narration's features (eg. Narration: "Everything is looking good. "). ''',
     )
+    screen_guidance: Optional[str] = Field(
+        default=None,
+        description="How a device/app/game screen shown in this shot must be rendered, when the script involves one: keep the on-screen content minimal and generic (simple shapes, no readable UI text, no fake interface detail) because the real screen content is replaced in post-production. None when no device screen is shown.",
+        examples=[
+            "Green card table with simple card shapes, no readable text or buttons — the real gameplay screen is inserted in editing.",
+            None,
+        ],
+    )
 
     # audio
     audio_desc: str = Field(
@@ -162,6 +177,13 @@ class ShotDescription(BaseModel):
             "[Speaker] Alice (Happy): Hello, how are you?",
             None,
         ],
+    )
+
+    # timing
+    duration_seconds: Optional[float] = Field(
+        default=None,
+        description="The duration of this shot in seconds, carried from the storyboard brief. Omit (null) when the script gave no per-shot timing; the pipeline-wide default then applies.",
+        examples=[3.0, 4.0, None],
     )
     # sound_effect: Optional[str] = Field(
     #     default=None,

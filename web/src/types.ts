@@ -18,8 +18,23 @@ export type ConfigSection = {
   has_api_key: boolean;
 };
 
+export type RenderConfigSection = {
+  image_aspect_ratio: string;
+  image_size: string;
+  video_aspect_ratio: string;
+  video_resolution: string;
+  allow_portrait: string;
+};
+
 export type AgentConfig = {
-  sections: Record<'llm' | 'image' | 'video' | 'embedding' | 'reranker', ConfigSection>;
+  sections: {
+    llm: ConfigSection;
+    image: ConfigSection;
+    video: ConfigSection;
+    embedding: ConfigSection;
+    reranker: ConfigSection;
+    render: RenderConfigSection;
+  };
 };
 
 export type Artifact = {

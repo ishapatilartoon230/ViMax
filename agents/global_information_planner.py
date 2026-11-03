@@ -143,6 +143,7 @@ class GlobalInformationPlanner:
         api_key: str,
         base_url: str,
         chat_model: str,
+        novel_skills: str = "",
     ):
         self.chat_model = init_chat_model(
             model=chat_model,
@@ -150,6 +151,13 @@ class GlobalInformationPlanner:
             api_key=api_key,
             base_url=base_url,
         )
+        self.novel_skills = (novel_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        # Defensive getattr: some callers build this planner via __new__
+        # (skipping __init__), so the attribute may not exist yet.
+        skills = getattr(self, "novel_skills", "")
+        return f"\n{skills}" if skills else ""
     
     @retry(
         stop=stop_after_attempt(3),
@@ -181,7 +189,7 @@ class GlobalInformationPlanner:
             SystemMessage(
                 content=system_prompt_template_merge_characters_across_scenes_in_event.format(
                     format_instructions=parser.get_format_instructions(),
-                ),
+                ) + self._skill_suffix(),
             ),
             HumanMessage(
                 content=human_prompt_template_merge_characters_across_scenes_in_event.format(
@@ -242,7 +250,7 @@ class GlobalInformationPlanner:
             SystemMessage(
                 content=system_prompt_template_merge_characters_to_existing_characters_in_novel.format(
                     format_instructions=parser.get_format_instructions(),
-                ),
+                ) + self._skill_suffix(),
             ),
             HumanMessage(
                 content=human_prompt_template_merge_characters_to_existing_characters_in_novel.format(

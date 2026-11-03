@@ -279,20 +279,21 @@ You need to configure the model and API key information in the configs/idea2vide
 ```yaml
 chat_model:
   init_args:
-    model: google/gemini-2.5-flash-lite-preview-09-2025
+    model: gemini-3.8-flash
     model_provider: openai
-    api_key: <YOUR_API_KEY>
-    base_url: https://openrouter.ai/api/v1
+    api_key: <YOUR_GOOGLE_API_KEY>
+    base_url: https://generativelanguage.googleapis.com/v1beta/openai/
 
 image_generator:
   class_path: tools.ImageGeneratorNanobananaGoogleAPI
   init_args:
-    api_key: <YOUR_API_KEY>
+    api_key: <YOUR_GOOGLE_API_KEY>
 
 video_generator:
-  class_path: tools.VideoGeneratorVeoGoogleAPI
+  class_path: tools.VideoGeneratorOmniGoogleAPI
   init_args:
-    api_key: <YOUR_API_KEY>
+    api_key: <YOUR_GOOGLE_API_KEY>
+    model: gemini-omni-1.1-flash
 
 working_dir: .working_dir/idea2video
 ```

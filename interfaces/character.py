@@ -31,6 +31,14 @@ class CharacterInScene(BaseModel):
             "Wearing a red scarf and a black leather jacket",
         ]
     )
+    voice_features: Optional[str] = Field(
+        default=None,
+        description="The voice identity of the character when they speak: gender/age feel, pitch, accent, timbre, and speaking rhythm (e.g. 'mature feminine voice, medium-low pitch, warm and slightly husky, subtle Indian-English accent, calm rhythm'). Extracted from the script's voice descriptions when present; None when the script says nothing about the voice.",
+        examples=[
+            "Mature feminine voice, medium-low pitch, warm and slightly husky, subtle Indian-English accent, calm soothing rhythm.",
+            None,
+        ]
+    )
 
     def __str__(self):
         # Alice[visible]
@@ -42,6 +50,8 @@ class CharacterInScene(BaseModel):
         s += "\n"
         s += f"static features: {self.static_features}\n"
         s += f"dynamic features: {self.dynamic_features}\n"
+        if self.voice_features:
+            s += f"voice features: {self.voice_features}\n"
 
         return s
 

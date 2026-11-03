@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -16,6 +18,11 @@ from .models import ToolCall
 LLM_MAX_ATTEMPTS = 3
 LLM_RETRY_BACKOFF_SECONDS = (1.0, 4.0)
 LLM_REQUEST_TIMEOUT_SECONDS = 300.0
+LLM_429_DEFAULT_WAIT_SECONDS = 30.0
+LLM_429_MAX_WAIT_DEFAULT_SECONDS = 65.0
+
+_RETRY_IN_RE = re.compile(r"retry in ([0-9]+(?:\.[0-9]+)?)\s*s", re.IGNORECASE)
+_RETRY_DELAY_RE = re.compile(r"'retryDelay'\s*:\s*'(\d+)\s*s'", re.IGNORECASE)
 
 
 def _is_retryable_llm_error(exc: BaseException) -> bool:
@@ -27,6 +34,45 @@ def _is_retryable_llm_error(exc: BaseException) -> bool:
             return False
         return status == 429 or status >= 500
     return isinstance(exc, (APIConnectionError, APITimeoutError))
+
+
+def _llm_429_max_wait_seconds() -> float:
+    raw = os.environ.get("VIMAX_LLM_429_MAX_WAIT_SECONDS", "").strip()
+    if not raw:
+        return LLM_429_MAX_WAIT_DEFAULT_SECONDS
+    try:
+        return min(300.0, max(5.0, float(raw)))
+    except ValueError:
+        return LLM_429_MAX_WAIT_DEFAULT_SECONDS
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Best-effort server-advised retry delay (seconds) from a rate-limit error.
+
+    Google's 429 body says ``Please retry in 49.9s`` and carries a
+    ``RetryInfo.retryDelay``; the HTTP layer may also send a ``Retry-After``
+    header. Any of them wins over our short default backoff.
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is not None:
+        try:
+            value = headers.get("retry-after")
+        except Exception:
+            value = None
+        if value:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                pass
+    text = str(exc)
+    match = _RETRY_IN_RE.search(text) or _RETRY_DELAY_RE.search(text)
+    if match:
+        try:
+            return float(match.group(1))
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 class LLMResponseShapeError(RuntimeError):
@@ -76,7 +122,19 @@ class OpenAICompatibleLLM:
                 if isinstance(exc, LLMResponseShapeError) or attempt == LLM_MAX_ATTEMPTS - 1 or not _is_retryable_llm_error(exc):
                     raise
                 delay = LLM_RETRY_BACKOFF_SECONDS[min(attempt, len(LLM_RETRY_BACKOFF_SECONDS) - 1)]
-                logging.warning("LLM call failed (%s); retrying in %.1fs (attempt %d/%d)", exc, delay, attempt + 1, LLM_MAX_ATTEMPTS)
+                status = getattr(exc, "status_code", None)
+                try:
+                    is_rate_limit = status is not None and int(status) == 429
+                except (TypeError, ValueError):
+                    is_rate_limit = False
+                if is_rate_limit:
+                    # The quota window closes on the server's schedule: honor
+                    # its advised delay instead of burning attempts against a
+                    # closed window.
+                    cap = _llm_429_max_wait_seconds()
+                    advised = _retry_after_seconds(exc)
+                    delay = min(cap, (advised + 1.0) if advised is not None else LLM_429_DEFAULT_WAIT_SECONDS)
+                logging.warning("LLM call failed (%s); retrying in %.1fs (attempt %d/%d)", str(exc)[:300], delay, attempt + 1, LLM_MAX_ATTEMPTS)
                 await asyncio.sleep(delay)
 
     async def _create_completion(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None, tool_choice: str | None) -> Any:
@@ -102,8 +160,29 @@ def _assistant_message_from_response(response: Any) -> AssistantMessage:
             arguments = json.loads(_message_value(function, "arguments") or "{}")
         except json.JSONDecodeError:
             arguments = {}
-        calls.append(ToolCall(id=_message_value(call, "id") or f"tool-{uuid4().hex[:12]}", name=_message_value(function, "name"), arguments=arguments))
+        calls.append(ToolCall(id=_message_value(call, "id") or f"tool-{uuid4().hex[:12]}", name=_message_value(function, "name"), arguments=arguments, thought_signature=_thought_signature(call)))
     return AssistantMessage(text=text, tool_calls=calls, raw_message=_dump_message(message))
+
+
+def _thought_signature(call: Any) -> str:
+    """Extract a Gemini thought_signature from a tool call, if present.
+
+    Thinking models attach the signature through a provider extension field
+    (``extra_content.google.thought_signature``); replaying a function call
+    without it is rejected by the API with HTTP 400.
+    """
+    extra = _message_value(call, "extra_content")
+    if not isinstance(extra, dict):
+        model_extra = getattr(call, "model_extra", None)
+        if isinstance(model_extra, dict):
+            extra = model_extra.get("extra_content")
+    if isinstance(extra, dict):
+        google = extra.get("google")
+        if isinstance(google, dict):
+            signature = google.get("thought_signature")
+            if isinstance(signature, str) and signature:
+                return signature
+    return ""
 
 
 def _extract_message(response: Any) -> Any:

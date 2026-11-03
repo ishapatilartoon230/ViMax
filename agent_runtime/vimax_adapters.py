@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from langchain.chat_models import init_chat_model
 from langchain_openai import OpenAIEmbeddings
@@ -18,12 +18,19 @@ from agents.event_extractor import EventExtractor
 from agents.global_information_planner import GlobalInformationPlanner
 from agents.novel_compressor import NovelCompressor
 from agents.scene_extractor import SceneExtractor
+from agents.script_planner import ScriptPlanner
+from agents.script_enhancer import ScriptEnhancer
 from pipelines.novel2movie_pipeline import Novel2MoviePipeline
 from pipelines.idea2video_pipeline import Idea2VideoPipeline
 from pipelines.script2video_pipeline import Script2VideoPipeline
+from utils.skills import StageSkills
+from utils.review_config import review_config_from_workspace
+from utils.script_fidelity import expected_shot_count, missing_dialogue_lines
+from tools.image_generator_nanobanana_google_api import ImageGeneratorNanobananaGoogleAPI
 from tools.image_generator_nanobanana_yunwu_api import ImageGeneratorNanobananaYunwuAPI
 from tools.image_generator_openrouter_api import ImageGeneratorOpenRouterAPI
 from tools.reranker_bge_silicon_api import RerankerBgeSiliconapi
+from tools.video_generator_omni_google_api import VideoGeneratorOmniGoogleAPI
 from tools.video_generator_openrouter_api import VideoGeneratorOpenRouterAPI
 from tools.video_generator_veo_yunwu_api import VideoGeneratorVeoYunwuAPI
 
@@ -31,6 +38,7 @@ from .config import api_provider_from_base_url, embedding_api_key, embedding_bas
 from .models import ToolResult
 from .config import image_num_candidates
 from utils.image_selection import DEFAULT_IMAGE_CANDIDATES
+from utils.render_geometry import resolve_render_geometry
 from .tools import ToolArgumentSchema, ToolRuntimeContext, ToolSpec
 
 
@@ -101,6 +109,80 @@ class ViMaxAdapters:
     def __init__(self, workspace_root: Path, session_index: Any) -> None:
         self.workspace_root = workspace_root.resolve()
         self.session_index = session_index
+        self.skills = StageSkills(self.workspace_root)
+        self.review_config = review_config_from_workspace(self.workspace_root)
+
+    async def _run_script_intake(self, script: str, runtime: ToolRuntimeContext | None, session_id: str) -> Optional[str]:
+        """Stage 0 for unstructured scripts: plan + enhance, then verify.
+
+        Runs only when the user's script has no explicit SHOT/SCENE structure;
+        shootable scripts bypass intake entirely (verbatim path). The enhanced
+        result must contain every quoted dialogue line of the original
+        (machine-checked) or the original is kept.
+        """
+        api_key = llm_api_key()
+        if not api_key:
+            return None
+        try:
+            if runtime:
+                runtime.emit_progress("Structuring unstructured script (planner + enhancer)", stage="script_intake_start", metadata={"session_id": session_id})
+            planner = ScriptPlanner(chat_model=llm_model(), base_url=llm_base_url(), api_key=api_key, planning_skills=self.skills.stages("script_planning", "script_engagement", "clip_contract"))
+            enhancer = ScriptEnhancer(chat_model=llm_model(), base_url=llm_base_url(), api_key=api_key, enhancement_skills=self.skills.stages("script_enhancement", "script_engagement", "clip_contract"))
+            planned = await asyncio.to_thread(planner.plan_script, script)
+            enhanced = await enhancer.enhance_script(planned_script=getattr(planned, "planned_script", str(planned)))
+            enhanced_text = getattr(enhanced, "enhanced_script", str(enhanced))
+            # Engagement bounce: the planner/enhancer WROTE this dialogue, so
+            # machine-check it for AI tells and give the enhancer one targeted
+            # rewrite pass. The verbatim fidelity check below stays final.
+            from utils.script_engagement import engagement_error_message, engagement_report
+            engagement = engagement_report(enhanced_text)
+            engagement_error = engagement_error_message(engagement)
+            if engagement_error:
+                if runtime:
+                    runtime.emit_progress("Dialogue engagement check failed; rewriting", stage="script_intake_engagement_bounce", metadata={"session_id": session_id, "hard_failures": engagement["hard_failures"][:5]})
+                try:
+                    enhanced = await enhancer.enhance_script(planned_script=enhanced_text + f"\n\n[Dialogue engagement feedback — fix these issues:\n{engagement_error}]")
+                    enhanced_text = getattr(enhanced, "enhanced_script", str(enhanced))
+                except Exception as bounce_exc:
+                    logging.warning("Engagement bounce failed (%s); keeping previous text", bounce_exc)
+            missing = missing_dialogue_lines(script, enhanced_text)
+            if missing:
+                logging.warning("Script intake dropped %d dialogue lines; keeping the original script", len(missing))
+                if runtime:
+                    runtime.emit_progress("Script intake lost dialogue; keeping original script", stage="script_intake_fidelity_failed", metadata={"session_id": session_id, "missing": missing})
+                return None
+            if runtime:
+                runtime.emit_progress("Structured script ready (dialogue verified verbatim)", stage="script_intake_done", metadata={"session_id": session_id})
+            return enhanced_text
+        except Exception as exc:
+            logging.warning("Script intake failed (%s); using the original script", exc)
+            if runtime:
+                runtime.emit_progress("Script intake failed; using original script", stage="script_intake_failed", metadata={"session_id": session_id, "error": str(exc)[:200]})
+            return None
+
+    def _review_chat_model(self, chat_model: Any) -> Any:
+        """A (possibly cheaper) dedicated model for orchestrator reviews.
+
+        Falls back to the pipeline's main chat model when review.model is not
+        configured, so reviews never break the render when unset.
+        """
+        model_name = str(self.review_config.get("model") or "").strip()
+        api_key = llm_api_key()
+        if not model_name or not api_key:
+            return chat_model
+        try:
+            return init_chat_model(
+                model=model_name,
+                model_provider=llm_model_provider(),
+                api_key=api_key,
+                base_url=llm_base_url(),
+                timeout=_llm_request_timeout_seconds(),
+                max_retries=0,
+                max_completion_tokens=_narrative_max_tokens(),
+            )
+        except Exception as exc:
+            logging.warning("Could not build review model %s (%s); reviews use the main model", model_name, exc)
+            return chat_model
 
     async def vimax_narrative_planning(self, args: dict[str, Any], runtime: ToolRuntimeContext | None = None) -> ToolResult:
         idea = str(args.get("idea", "") or "").strip()
@@ -141,6 +223,10 @@ class ViMaxAdapters:
                 runtime.emit_progress("Initializing bounded chat model", stage="initializing_llm", metadata={"session_id": session_id, "timeout_seconds": _llm_request_timeout_seconds(), "max_tokens": _narrative_max_tokens()})
                 await asyncio.sleep(0)
             chat_model = _build_chat_model()
+            # Planning must validate against the same geometry the render gate
+            # resolves (user config + env), not the built-in defaults —
+            # otherwise a plan can pass planning and be refused at render.
+            render_geometry = resolve_render_geometry(self.workspace_root)
             if runtime:
                 runtime.emit_progress("Bounded chat model initialized", stage="chat_model_ready", metadata={"session_id": session_id})
                 await asyncio.sleep(0)
@@ -148,7 +234,7 @@ class ViMaxAdapters:
             # Do not globally redirect stdout/stderr while the JSONL CLI is streaming events.
             # The adapter exposes pipeline progress through explicit tool_progress events instead.
             if idea:
-                idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=dummy, video_generator=dummy, working_dir=str(idea_dir))
+                idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=dummy, video_generator=dummy, working_dir=str(idea_dir), render_geometry=render_geometry, skills=self.skills, review_config=self.review_config, review_chat_model=self._review_chat_model(chat_model))
                 if runtime:
                     runtime.emit_progress("Idea pipeline initialized", stage="idea_pipeline_ready", metadata={"session_id": session_id})
                     await asyncio.sleep(0)
@@ -176,7 +262,7 @@ class ViMaxAdapters:
                 for idx, scene_script in enumerate(scene_scripts if isinstance(scene_scripts, list) else [scene_scripts]):
                     scene_dir = idea_dir / f"scene_{idx}"
                     scene_text = scene_script if isinstance(scene_script, str) else json.dumps(scene_script, ensure_ascii=False, indent=2)
-                    script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=dummy, video_generator=dummy, working_dir=str(scene_dir))
+                    script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=dummy, video_generator=dummy, working_dir=str(scene_dir), render_geometry=render_geometry, skills=self.skills, review_config=self.review_config, review_chat_model=self._review_chat_model(chat_model))
                     await _run_planning_step(
                         f"Planning scene {idx} storyboard and shots",
                         "plan_scene",
@@ -185,8 +271,15 @@ class ViMaxAdapters:
                         {"session_id": session_id, "scene_index": idx},
                     )
             else:
+                if expected_shot_count(script) is None:
+                    # Unstructured script: run Stage 0 intake (plan + enhance)
+                    # with the mechanical dialogue-verbatim guard before storing.
+                    enhanced = await self._run_script_intake(script, runtime, session_id)
+                    if enhanced:
+                        (script_dir / "script_source.txt").write_text(script, encoding="utf-8")
+                        script = enhanced
                 (script_dir / "script.txt").write_text(script, encoding="utf-8")
-                script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=dummy, video_generator=dummy, working_dir=str(script_dir))
+                script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=dummy, video_generator=dummy, working_dir=str(script_dir), render_geometry=render_geometry, skills=self.skills, review_config=self.review_config, review_chat_model=self._review_chat_model(chat_model))
                 if runtime:
                     runtime.emit_progress("Script pipeline initialized", stage="script_pipeline_ready", metadata={"session_id": session_id})
                     await asyncio.sleep(0)
@@ -200,15 +293,25 @@ class ViMaxAdapters:
         except Exception as exc:
             self.session_index.update_stage(session_id, "error", f"Narrative planning failed: {exc}")
             checklist = self.session_index.artifact_checklist(session_id)
+            dialogue_refusal = _is_dialogue_fit_failure(exc)
             payload = {
                 "session_id": session_id,
                 "working_dir": str(working_dir.relative_to(self.workspace_root)),
-                "error_type": "recoverable_planning_step_failed",
-                "retryable": True,
+                "error_type": "dialogue_fit_exceeded" if dialogue_refusal else "recoverable_planning_step_failed",
+                # A dialogue-fit refusal is deterministic: retrying the same
+                # inputs re-runs every LLM stage and fails identically.
+                "retryable": not dialogue_refusal,
                 "error": str(exc),
                 "present": [path for path, present in checklist.items() if present],
                 "missing": [path for path, present in checklist.items() if not present],
             }
+            if dialogue_refusal:
+                payload["recommended_action"] = (
+                    "Dialogue cannot fit its shot budgets and the total-duration cap blocks extending them "
+                    "(mechanical extension was already attempted). Present the recommendation to the user and "
+                    "revise the plan: split the over-budget lines into separate shots, shorten the dialogue, "
+                    "or raise render.max_total_video_seconds. Do not retry narrative planning with unchanged inputs."
+                )
             if runtime:
                 runtime.emit_progress("Narrative planning failed; partial artifacts were kept", stage="planning_failed", metadata=payload)
             return ToolResult("vimax_narrative_planning", False, f"Narrative planning failed: {exc}", payload)
@@ -217,9 +320,14 @@ class ViMaxAdapters:
         generated = [path for path, present in checklist.items() if present and not generated_before.get(path)]
         reused = [path for path, present in checklist.items() if present and generated_before.get(path)]
         ready_for_render = _ready_for_render(checklist)
+        render_mode = _render_mode_for_checklist(checklist)
+        duration_budget = _duration_budget(
+            _planned_shot_durations(working_dir, render_mode),
+            resolve_render_geometry(self.workspace_root),
+        )
         self.session_index.update_stage(session_id, "narrative_planned", "Structured text planning complete" if ready_for_render else "Structured text planning partially complete")
         if runtime:
-            runtime.emit_progress("Narrative planning complete", stage="completed", metadata={"ready_for_render": ready_for_render})
+            runtime.emit_progress("Narrative planning complete", stage="completed", metadata={"ready_for_render": ready_for_render, "duration_budget": duration_budget})
         payload = {
             "session_id": session_id,
             "working_dir": str(working_dir.relative_to(self.workspace_root)),
@@ -227,6 +335,7 @@ class ViMaxAdapters:
             "reused": reused,
             "missing": [path for path, present in checklist.items() if not present],
             "ready_for_render": ready_for_render,
+            "duration_budget": duration_budget,
         }
         return ToolResult("vimax_narrative_planning", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
 
@@ -301,7 +410,7 @@ class ViMaxAdapters:
             if runtime:
                 runtime.emit_progress("Starting novel planning", stage="starting", metadata={"session_id": session_id})
                 await asyncio.sleep(0)
-            pipeline = _build_novel_pipeline(novel_dir)
+            pipeline = _build_novel_pipeline(novel_dir, skills=self.skills)
             await _run_planning_step(
                 "Planning novel structured text artifacts",
                 "novel_plan_text_artifacts",
@@ -351,6 +460,51 @@ class ViMaxAdapters:
             _write_render_status(working_dir, status="dependency_missing", payload=payload)
             return ToolResult("vimax_render_video", False, f"Dependency missing: {', '.join(missing)}", payload)
 
+        render_geometry = resolve_render_geometry(self.workspace_root)
+        render_mode = _render_mode_for_checklist(checklist)
+        duration_budget = _duration_budget(_planned_shot_durations(working_dir, render_mode), render_geometry)
+        if render_mode in ("idea2video", "script2video") and not duration_budget["within_limit"]:
+            message = (
+                f"Duration limit exceeded: {duration_budget['shots']} shots totalling {duration_budget['total_seconds']:g}s "
+                f"(per-shot: {duration_budget['per_shot_seconds']}), above the {duration_budget['max_total_seconds']:g}s maximum. "
+                "Revise the plan to fewer or shorter shots."
+            )
+            payload = {"error_type": "duration_limit_exceeded", "duration_budget": duration_budget, "render_mode": render_mode, "session_id": session_id}
+            _write_render_status(working_dir, status="duration_limit_exceeded", payload=payload)
+            if runtime:
+                runtime.emit_progress("Render refused: duration limit exceeded", stage="duration_limit_exceeded", metadata=payload)
+            return ToolResult("vimax_render_video", False, message, payload)
+
+        if render_mode in ("idea2video", "script2video"):
+            from utils.dialogue_fit import dialogue_fit_error_message
+
+            fit = _planned_dialogue_fit(working_dir, render_mode, render_geometry)
+            fit_error = dialogue_fit_error_message(fit)
+            if fit_error:
+                payload = {"error_type": "dialogue_fit_exceeded", "dialogue_fit": fit, "render_mode": render_mode, "session_id": session_id}
+                _write_render_status(working_dir, status="dialogue_fit_exceeded", payload=payload)
+                if runtime:
+                    runtime.emit_progress("Render refused: dialogue cannot fit its shot budgets", stage="dialogue_fit_exceeded", metadata=payload)
+                return ToolResult("vimax_render_video", False, fit_error, payload)
+
+        if render_mode == "script2video":
+            from utils.script_fidelity import script_fidelity_error_message, script_fidelity_report
+
+            script_text = _load_script_text(working_dir)
+            storyboard_path = working_dir / "script2video" / "storyboard.json"
+            try:
+                storyboard_payload = json.loads(storyboard_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                storyboard_payload = []
+            fidelity = script_fidelity_report(script_text, storyboard_payload if isinstance(storyboard_payload, list) else [])
+            fidelity_error = script_fidelity_error_message(fidelity)
+            if fidelity_error:
+                payload = {"error_type": "script_fidelity_failed", "fidelity": fidelity, "render_mode": render_mode, "session_id": session_id}
+                _write_render_status(working_dir, status="script_fidelity_failed", payload=payload)
+                if runtime:
+                    runtime.emit_progress("Render refused: plan lost script content", stage="script_fidelity_failed", metadata=payload)
+                return ToolResult("vimax_render_video", False, fidelity_error, payload)
+
         self.session_index.update_stage(session_id, "rendering", "Rendering video artifacts")
         _write_render_status(working_dir, status="rendering", payload={"session_id": session_id, "render_started": True, "render_completed": False})
         try:
@@ -358,30 +512,31 @@ class ViMaxAdapters:
             image_generator = _build_image_generator()
             video_generator = _build_video_generator()
             num_image_candidates = image_num_candidates(self.workspace_root)
+            render_geometry = resolve_render_geometry(self.workspace_root)
             if runtime:
                 runtime.emit_progress("Starting video render", stage="rendering", metadata={"session_id": session_id})
             if _idea_mode_ready(checklist):
-                idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "idea2video"), num_image_candidates=num_image_candidates)
+                idea_pipeline = Idea2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "idea2video"), num_image_candidates=num_image_candidates, render_geometry=render_geometry, skills=self.skills, review_config=self.review_config, review_chat_model=self._review_chat_model(chat_model))
                 with _suppress_pipeline_output():
                     final_video = await idea_pipeline(idea=str(session.get("idea", "")), user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), quiet=True, progress=_pipeline_progress(runtime, session_id))
                 self.session_index.update_stage(session_id, "rendered", "Final video rendered")
-                payload = {"session_id": session_id, "render_mode": "idea2video", "render_started": True, "render_completed": True, "final_video_path": str(Path(final_video).relative_to(self.workspace_root)), "missing": []}
+                payload = {"session_id": session_id, "render_mode": "idea2video", "render_started": True, "render_completed": True, "final_video_path": str(Path(final_video).resolve().relative_to(self.workspace_root)), "missing": []}
                 _write_render_status(working_dir, status="rendered", payload=payload)
                 return ToolResult("vimax_render_video", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
             if _script_mode_ready(checklist):
                 script_dir = working_dir / "script2video"
                 script_text = _load_script_text(working_dir)
                 characters = _load_characters(script_dir / "characters.json")
-                pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(script_dir), num_image_candidates=num_image_candidates)
+                pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(script_dir), num_image_candidates=num_image_candidates, render_geometry=render_geometry, skills=self.skills, review_config=self.review_config, review_chat_model=self._review_chat_model(chat_model))
                 with _suppress_pipeline_output():
                     final_video = await pipeline(script=script_text, user_requirement=str(session.get("user_requirement", "")), style=str(session.get("style", "")), characters=characters, quiet=True, progress=_pipeline_progress(runtime, session_id))
                 self.session_index.update_stage(session_id, "rendered", "Final video rendered")
-                payload = {"session_id": session_id, "render_mode": "script2video", "render_started": True, "render_completed": True, "final_video_path": str(Path(final_video).relative_to(self.workspace_root)), "missing": []}
+                payload = {"session_id": session_id, "render_mode": "script2video", "render_started": True, "render_completed": True, "final_video_path": str(Path(final_video).resolve().relative_to(self.workspace_root)), "missing": []}
                 _write_render_status(working_dir, status="rendered", payload=payload)
                 return ToolResult("vimax_render_video", True, json.dumps(payload, ensure_ascii=False, indent=2), payload)
             if _novel_mode_ready(checklist):
                 novel_dir = working_dir / "novel2video"
-                pipeline = _build_novel_render_pipeline(novel_dir, chat_model, image_generator, video_generator, num_image_candidates=num_image_candidates)
+                pipeline = _build_novel_render_pipeline(novel_dir, chat_model, image_generator, video_generator, num_image_candidates=num_image_candidates, render_geometry=render_geometry, skills=self.skills, review_config=self.review_config, review_chat_model=self._review_chat_model(chat_model))
                 with _suppress_pipeline_output():
                     render_result = await pipeline.render_video_artifacts(style=str(session.get("style", "")), user_requirement=str(session.get("user_requirement", "")), quiet=True, progress=_pipeline_progress(runtime, session_id))
                 scene_videos_dir = Path(render_result["scene_videos_dir"])
@@ -393,8 +548,8 @@ class ViMaxAdapters:
                     "render_completed": True,
                     "scene_render_completed": True,
                     "final_video_path": None,
-                    "scene_videos_dir": str(scene_videos_dir.relative_to(self.workspace_root)),
-                    "scene_video_dirs": [str(Path(path).relative_to(self.workspace_root)) for path in render_result.get("scene_video_dirs", [])],
+                    "scene_videos_dir": str(scene_videos_dir.resolve().relative_to(self.workspace_root)),
+                    "scene_video_dirs": [str(Path(path).resolve().relative_to(self.workspace_root)) for path in render_result.get("scene_video_dirs", [])],
                     "scene_count": render_result.get("scene_count", 0),
                     "missing": [],
                 }
@@ -497,6 +652,27 @@ def _narrative_step_timeout_seconds() -> float:
         return 900.0
 
 
+def _is_dialogue_fit_failure(exc: BaseException) -> bool:
+    """Whether a planning failure is a mechanical dialogue-fit refusal.
+
+    ``_run_planning_step`` wraps stage errors in RuntimeError, so the typed
+    DialogueFitError has to be found through the cause chain; the message
+    marker is the fallback for cases where the type was lost on the way up.
+    """
+    from utils.dialogue_fit import DialogueFitError
+
+    if "Dialogue cannot fit its shot budgets" in str(exc):
+        return True
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, DialogueFitError):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 async def _run_planning_step(
     message: str,
     stage: str,
@@ -538,11 +714,13 @@ def _llm_request_timeout_seconds() -> float:
 
 
 def _narrative_max_tokens() -> int:
-    raw = os.environ.get("VIMAX_NARRATIVE_MAX_TOKENS", "4096")
+    # Thinking models (e.g. gemini-3.x flash) count reasoning toward the
+    # completion budget, so keep headroom for long structured artifacts.
+    raw = os.environ.get("VIMAX_NARRATIVE_MAX_TOKENS", "16384")
     try:
         return max(256, int(raw))
     except ValueError:
-        return 4096
+        return 16384
 
 
 def _pipeline_progress(runtime: ToolRuntimeContext | None, session_id: str, *, scene_index: int | None = None):
@@ -574,18 +752,23 @@ def _build_chat_model() -> Any:
     )
 
 
-def _build_image_generator() -> ImageGeneratorNanobananaYunwuAPI | ImageGeneratorOpenRouterAPI:
+def _build_image_generator() -> ImageGeneratorNanobananaGoogleAPI | ImageGeneratorNanobananaYunwuAPI | ImageGeneratorOpenRouterAPI:
     api_key = image_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_IMAGE_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml image/llm api_key is required for image generation")
     model = image_model()
     base_url = image_base_url()
-    if api_provider_from_base_url(base_url) == "openrouter":
+    provider = api_provider_from_base_url(base_url)
+    if provider == "openrouter":
         return ImageGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url)
+    if provider in ("", "google"):
+        # Official Google Gemini API; the native client resolves the endpoint itself.
+        return ImageGeneratorNanobananaGoogleAPI(api_key=api_key, model=model)
+    # Custom google-genai compatible relay (e.g. yunwu.ai) routed through base_url.
     return ImageGeneratorNanobananaYunwuAPI(api_key=api_key, model=model, base_url=base_url)
 
 
-def _build_video_generator() -> VideoGeneratorVeoYunwuAPI | VideoGeneratorOpenRouterAPI:
+def _build_video_generator() -> VideoGeneratorOmniGoogleAPI | VideoGeneratorVeoYunwuAPI | VideoGeneratorOpenRouterAPI:
     api_key = video_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_VIDEO_API_KEY, VIMAX_LLM_API_KEY, or configs/agent.local.yaml video/llm api_key is required for video generation")
@@ -596,6 +779,10 @@ def _build_video_generator() -> VideoGeneratorVeoYunwuAPI | VideoGeneratorOpenRo
         return VideoGeneratorOpenRouterAPI(api_key=api_key, model=model, base_url=base_url)
     if provider == "yunwu":
         return VideoGeneratorVeoYunwuAPI(api_key=api_key, t2v_model=model, ff2v_model=model, base_url=base_url)
+    if provider == "google":
+        # Official Google Gemini API; video generation runs through the
+        # Interactions API with Gemini Omni Flash (Veo previews were retired).
+        return VideoGeneratorOmniGoogleAPI(api_key=api_key, model=model)
     raise RuntimeError(f"Unsupported video base_url for automatic provider matching: {base_url}")
 
 
@@ -612,7 +799,10 @@ def _build_embedding_model() -> Any:
         raise RuntimeError("VIMAX_EMBEDDING_API_KEY or configs/agent.local.yaml embedding api_key/base_url is required for novel planning")
     if provider != "openai":
         raise RuntimeError(f"Unsupported embedding model_provider: {provider}")
-    return OpenAIEmbeddings(model=embedding_model(), api_key=api_key, base_url=base_url)
+    # check_embedding_ctx_length=False skips the tiktoken/base64 request shape
+    # that non-OpenAI compatible endpoints (e.g. the Gemini OpenAI-compat API)
+    # do not implement.
+    return OpenAIEmbeddings(model=embedding_model(), api_key=api_key, base_url=base_url, check_embedding_ctx_length=False)
 
 
 def _build_reranker() -> RerankerBgeSiliconapi:
@@ -623,20 +813,21 @@ def _build_reranker() -> RerankerBgeSiliconapi:
     return RerankerBgeSiliconapi(api_key=api_key, base_url=base_url, model=reranker_model())
 
 
-def _build_novel_pipeline(working_dir: Path) -> Novel2MoviePipeline:
+def _build_novel_pipeline(working_dir: Path, skills: "StageSkills | None" = None) -> Novel2MoviePipeline:
     api_key = llm_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_LLM_API_KEY or configs/agent.local.yaml llm.api_key is required for novel planning")
     base_url = llm_base_url()
     model = llm_model()
     dummy = _UnavailableGenerator()
+    novel_skills = skills.stages("novel_adaptation", "script_engagement") if skills is not None else ""
     return Novel2MoviePipeline(
-        novel_compressor=NovelCompressor(api_key=api_key, base_url=base_url, chat_model=model),
-        event_extractor=EventExtractor(api_key=api_key, base_url=base_url, chat_model=model),
+        novel_compressor=NovelCompressor(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
+        event_extractor=EventExtractor(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
         embeddings=_build_embedding_model(),
         rerank_model=_build_reranker(),
-        scene_extractor=SceneExtractor(api_key=api_key, base_url=base_url, chat_model=model),
-        global_information_planner=GlobalInformationPlanner(api_key=api_key, base_url=base_url, chat_model=model),
+        scene_extractor=SceneExtractor(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
+        global_information_planner=GlobalInformationPlanner(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
         image_generator=dummy,
         rewriter=_IdentityRewriter(),
         script2video_pipeline=dummy,
@@ -644,20 +835,21 @@ def _build_novel_pipeline(working_dir: Path) -> Novel2MoviePipeline:
     )
 
 
-def _build_novel_render_pipeline(working_dir: Path, chat_model: Any, image_generator: Any, video_generator: Any, num_image_candidates: int = DEFAULT_IMAGE_CANDIDATES) -> Novel2MoviePipeline:
+def _build_novel_render_pipeline(working_dir: Path, chat_model: Any, image_generator: Any, video_generator: Any, num_image_candidates: int = DEFAULT_IMAGE_CANDIDATES, render_geometry: dict[str, Any] | None = None, skills: "StageSkills | None" = None, review_config: dict[str, Any] | None = None, review_chat_model: Any = None) -> Novel2MoviePipeline:
     api_key = llm_api_key()
     if not api_key:
         raise RuntimeError("VIMAX_LLM_API_KEY or configs/agent.local.yaml llm.api_key is required for novel rendering")
     base_url = llm_base_url()
     model = llm_model()
-    script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "videos"), num_image_candidates=num_image_candidates)
+    novel_skills = skills.stages("novel_adaptation", "script_engagement") if skills is not None else ""
+    script_pipeline = Script2VideoPipeline(chat_model=chat_model, image_generator=image_generator, video_generator=video_generator, working_dir=str(working_dir / "videos"), num_image_candidates=num_image_candidates, render_geometry=render_geometry, skills=skills, review_config=review_config, review_chat_model=review_chat_model)
     return Novel2MoviePipeline(
-        novel_compressor=NovelCompressor(api_key=api_key, base_url=base_url, chat_model=model),
-        event_extractor=EventExtractor(api_key=api_key, base_url=base_url, chat_model=model),
+        novel_compressor=NovelCompressor(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
+        event_extractor=EventExtractor(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
         embeddings=_build_embedding_model(),
         rerank_model=_build_reranker(),
-        scene_extractor=SceneExtractor(api_key=api_key, base_url=base_url, chat_model=model),
-        global_information_planner=GlobalInformationPlanner(api_key=api_key, base_url=base_url, chat_model=model),
+        scene_extractor=SceneExtractor(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
+        global_information_planner=GlobalInformationPlanner(api_key=api_key, base_url=base_url, chat_model=model, novel_skills=novel_skills),
         image_generator=image_generator,
         rewriter=_IdentityRewriter(),
         script2video_pipeline=script_pipeline,
@@ -803,6 +995,78 @@ def _stale_keys_for_revision(target: str) -> list[str]:
 
 def _ready_for_render(checklist: dict[str, bool]) -> bool:
     return _idea_mode_ready(checklist) or _script_mode_ready(checklist) or _novel_mode_ready(checklist)
+
+
+def _render_mode_for_checklist(checklist: dict[str, bool]) -> str:
+    if _idea_mode_ready(checklist):
+        return "idea2video"
+    if _script_mode_ready(checklist):
+        return "script2video"
+    if _novel_mode_ready(checklist):
+        return "novel2video"
+    return ""
+
+
+def _planned_shot_durations(working_dir: Path, mode: str) -> list[float | None]:
+    """Per-shot durations from the session's shot_description.json files.
+
+    None entries mean "no explicit timing in the plan" — the pipeline default
+    applies at render time.
+    """
+    if mode == "idea2video":
+        paths = sorted((working_dir / "idea2video").glob("scene_*/shots/*/shot_description.json"))
+    elif mode == "script2video":
+        paths = sorted((working_dir / "script2video").glob("shots/*/shot_description.json"))
+    else:
+        return []
+    durations: list[float | None] = []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        value = payload.get("duration_seconds")
+        durations.append(float(value) if isinstance(value, (int, float)) and value > 0 else None)
+    return durations
+
+
+def _duration_budget(durations: list[float | None], geometry: dict[str, Any]) -> dict[str, Any]:
+    default_seconds = float(geometry.get("video_seconds", 8.0))
+    maximum = float(geometry.get("max_total_video_seconds", 40.0))
+    resolved = [value if value is not None else default_seconds for value in durations]
+    total = round(sum(resolved), 2)
+    return {
+        "shots": len(resolved),
+        "seconds_per_shot": default_seconds,
+        "per_shot_seconds": resolved,
+        "total_seconds": total,
+        "max_total_seconds": maximum,
+        "within_limit": total <= maximum + 1e-6,
+    }
+
+
+def _planned_shots(working_dir: Path, mode: str) -> list[dict[str, Any]]:
+    if mode == "idea2video":
+        paths = sorted((working_dir / "idea2video").glob("scene_*/shots/*/shot_description.json"))
+    elif mode == "script2video":
+        paths = sorted((working_dir / "script2video").glob("shots/*/shot_description.json"))
+    else:
+        return []
+    shots: list[dict[str, Any]] = []
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict):
+            shots.append(payload)
+    return shots
+
+
+def _planned_dialogue_fit(working_dir: Path, mode: str, geometry: dict[str, Any]) -> dict[str, Any]:
+    from utils.dialogue_fit import dialogue_fit_report
+
+    return dialogue_fit_report(_planned_shots(working_dir, mode), float(geometry.get("video_seconds", 8.0)))
 
 
 def _missing_render_dependencies(checklist: dict[str, bool]) -> list[str]:

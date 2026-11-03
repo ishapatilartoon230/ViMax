@@ -3,15 +3,78 @@ import json
 import tempfile
 import unittest
 from copy import deepcopy
+from unittest.mock import patch
 
 from agent_runtime.context_compactor import ContextCompactor
 from agent_runtime.llm import AssistantMessage
-from agent_runtime.loop import AgentLoop
+from agent_runtime.loop import AgentLoop, _is_context_limit_error
 from agent_runtime.models import ToolCall, ToolResult
 from agent_runtime.prompts import PromptBuilder
 from agent_runtime.session_index import SessionIndex
 from agent_runtime.tool_executor import ToolExecutor
 from agent_runtime.tools import ToolArgumentSchema, ToolRegistry, ToolSpec
+
+
+class ContextLimitError(Exception):
+    pass
+
+
+class FlakyThenRecoveringLLM:
+    """Raises the provider's context-limit 400 once, then serves replies."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+
+    async def complete(self, messages, tools):
+        if self.replies and isinstance(self.replies[0], Exception):
+            raise self.replies.pop(0)
+        return self.replies.pop(0)
+
+
+class ContextLimitRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_detects_provider_context_limit_errors(self):
+        google_message = "Error code: 400 - [{'error': {'code': 400, 'message': 'The input token count exceeds the maximum number of tokens allowed (1048576).', 'status': 'INVALID_ARGUMENT'}}]"
+        self.assertTrue(_is_context_limit_error(ContextLimitError(google_message)))
+        self.assertTrue(_is_context_limit_error(RuntimeError("context length exceeded")))
+        self.assertFalse(_is_context_limit_error(RuntimeError("connection refused")))
+        self.assertFalse(_is_context_limit_error(RuntimeError("401 unauthorized")))
+
+    async def test_context_limit_error_compacts_and_retries_instead_of_failing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            registry = ToolRegistry([])
+            llm = FlakyThenRecoveringLLM([
+                ContextLimitError("Error code: 400 - input token count exceeds the maximum number of tokens allowed (1048576)"),
+                AssistantMessage(text="compacted summary of the turn"),
+                AssistantMessage(text="recovered answer"),
+            ])
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+            events = [event async for event in loop.stream_events("long turn")]
+            done = [event for event in events if event["type"] == "done"][0]
+            self.assertEqual(done["assistant"], "recovered answer")
+            statuses = [event.get("phase") for event in events if event["type"] == "status"]
+            self.assertIn("compact", statuses)
+
+    async def test_mid_turn_pressure_compacts_between_tool_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+
+            def ping(args):
+                return ToolResult("ping", True, "pong " * 4000)  # large enough to cross the tiny test threshold
+
+            registry = ToolRegistry([ToolSpec("ping", "Ping", ping, schema={})])
+            llm = FlakyThenRecoveringLLM([
+                AssistantMessage(tool_calls=[ToolCall(name="ping", arguments={})]),
+                AssistantMessage(text="turn summary"),
+                AssistantMessage(text="done after tools"),
+            ])
+            with patch.dict("os.environ", {"VIMAX_CONTEXT_WINDOW_TOKENS": "1500", "VIMAX_AUTO_COMPACT_BUFFER_TOKENS": "50"}):
+                loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+                events = [event async for event in loop.stream_events("run the tool")]
+            statuses = [event.get("phase") for event in events if event["type"] == "status"]
+            self.assertIn("compact", statuses)
+            done = [event for event in events if event["type"] == "done"][0]
+            self.assertEqual(done["assistant"], "done after tools")
 
 
 class FakeLLM:

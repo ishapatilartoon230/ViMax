@@ -4,7 +4,6 @@ from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt
 
 from langchain.chat_models.base import BaseChatModel
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import PydanticOutputParser
 from interfaces import CharacterInScene, ShotDescription, ShotBriefDescription
 
@@ -40,6 +39,7 @@ The user will provide the following input.
 
 [Guidelines]
 - Ensure all output values (except keys) match the language used in the script.
+- **Dialogue language is sacred**: copy every dialogue line verbatim in the exact language the user's script uses (English, Hindi, Spanish, anything). Never translate, paraphrase, or reword a quoted line — descriptions may be written in the working language, but quoted dialogue stays in the user's language word-for-word.
 - Each shot must have a clear narrative purpose—such as establishing the setting, showing character relationships, or highlighting reactions.
 - Use cinematic language deliberately: close-ups for emotion, wide shots for context, and varied angles to direct audience attention.
 - When designing a new shot, first consider whether it can be filmed using an existing camera position. Introduce a new one only if the shot size, angle, and focus differ significantly. If the camera undergoes significant movement, it cannot be used thereafter.
@@ -47,6 +47,9 @@ The user will provide the following input.
 - When describing visual elements, it is necessary to indicate the position of the element within the frame. For example, Character A is on the left side of the frame, facing toward the right, with a table in front of him. The table is positioned slightly to the left of the center of the frame. Ensure that invisible elements are not included. For instance, do not describe someone behind a closed door if they cannot be seen.
 - Avoid unsafe content (violence, discrimination, etc.) in visual descriptions. Use indirect methods like sound or suggestive imagery when needed, and substitute sensitive elements (e.g., ketchup for blood).
 - Assign at most one dialogue line per character per shot. Each line of dialogue should correspond to a shot.
+- Timing: when the script states a duration per scene or shot (e.g. "Duration: 3 seconds", "0:00-0:03"), copy that number into `duration_seconds` for the matching shot, in seconds. When the script gives no per-shot timing, leave `duration_seconds` null. The sum of all `duration_seconds` must equal the script's stated total duration when one is given.
+- Dialogue must fit its shot's time: speech runs at about 2.8 words per second plus 0.3s between consecutive lines, so N seconds fits at most (N - 0.3 x (L-1)) x 2.8 words across L quoted lines. Copy the script's dialogue and timing verbatim even when they conflict — the pipeline rebalances shot budgets mechanically. Never drop, shorten, merge, or split lines to make them fit.
+- When the user explicitly states the total number of shots (e.g. "6 shots"), produce exactly that many shots; one scene maps to one shot unless the script itself lists sub-shots AND the user's stated count allows them.
 - Each shot requires an independent description without reference to each other.
 - When the shot focuses on a character, describe which specific body part the focus is on.
 - When describing a character, it is necessary to indicate the direction they are facing.
@@ -93,6 +96,7 @@ Additionally, you will receive a sequence of potential characters, each containi
 
 [Guidelines]
 - Ensure all output values (except keys) match the language used in the script.
+- Quoted dialogue lines are copied verbatim in the user's language — never translated or reworded.
 - Ensure the first and last frame descriptions are pure "snapshots," containing no ongoing actions (e.g., "He is about to stand up" is unacceptable; it should be "He is sitting on the chair, leaning slightly forward").
 - In the motion description, you must clearly distinguish between camera movement and on-screen movement. Use professional cinematic terminology (e.g., dolly shot, pan, zoom, etc.) as precisely as possible to describe camera movement.
 - In the motion description, you cannot directly use character names to refer to characters; instead, you should use the characters' visible characteristics to refer to them. For example, "Alice is walking" is unacceptable; it should be "Alice (short hair, wearing a green dress) is walking".
@@ -104,9 +108,12 @@ Additionally, you will receive a sequence of potential characters, each containi
 (1) 'large' cases typically involve the exaggerated transition shots which means a significant change in the composition and focus, such as smoothly changing from a wide shot to a close-up. It is usually accompanied by significant camera movement (e.g., drone perspective shots across the city).
 (2) 'medium' cases often involve the introduction of new characters and a character turns from the back to face the front (facing the camera).
 (3) 'small' cases usually involve minor changes, such as expression changes, movement and pose changes of existing characters(e.g., walking, sitting down, standing up), moderate camera movements(e.g., pan, tilt, track).
+- Variation measures the VISUAL difference between the first and last frame — of the whole image, not just the camera. A device or prop that rotates to show a different face (screen facing camera -> back cover facing camera, or the reverse) changes the most important object in the frame: that shot is at least 'medium', never 'small'. Camera framing staying similar does NOT make a prop flip 'small'.
 - When describing a character, it is necessary to indicate the direction they are facing.
 - The first shot must establish the overall scene environment, using the widest possible shot.
 - Use as few camera positions as possible.
+- Structure the motion description as 2-4 timecoded sub-beats when the shot contains dialogue or multiple actions (e.g. "0.0-2.5s: ... 2.5-5.0s: ..."), each sub-beat holding one action and its quoted line. Gestures happen DURING the line they belong to ("she raises one finger as she says ..."), never after all the dialogue finishes.
+- When the shot shows a device/app/game screen, fill the screen_guidance field: keep on-screen content minimal and generic — simple shapes and colors, NO readable UI text, no fake interface detail — because the real screen content is inserted in post-production. Never invent detailed game or app mechanics. Leave screen_guidance empty when no screen is shown.
 """
 
 
@@ -171,8 +178,18 @@ class StoryboardArtist:
     def __init__(
         self,
         chat_model: BaseChatModel,
+        storyboard_skills: str = "",
+        decomposition_skills: str = "",
     ):
         self.chat_model = chat_model
+        self.storyboard_skills = (storyboard_skills or "").strip()
+        self.decomposition_skills = (decomposition_skills or "").strip()
+
+    def _storyboard_skill_suffix(self) -> str:
+        return f"\n{self.storyboard_skills}" if self.storyboard_skills else ""
+
+    def _decomposition_skill_suffix(self) -> str:
+        return f"\n{self.decomposition_skills}" if self.decomposition_skills else ""
 
 
     @retry(stop=stop_after_attempt(3), after=after_func)
@@ -195,7 +212,7 @@ class StoryboardArtist:
 
         parser = PydanticOutputParser(pydantic_object=StoryboardResponse)
         messages = [
-            ('system', system_prompt_template_design_storyboard.format(format_instructions=parser.get_format_instructions())),
+            ('system', system_prompt_template_design_storyboard.format(format_instructions=parser.get_format_instructions()) + self._storyboard_skill_suffix()),
             ('human', human_prompt_template_design_storyboard.format(script_str=script_str, characters_str=characters_str, user_requirement_str=user_requirement_str)),
         ]
         chain = self.chat_model | parser
@@ -218,26 +235,19 @@ class StoryboardArtist:
         retry_timeout: int = 150,
     ) -> ShotDescription:
         parser = PydanticOutputParser(pydantic_object=VisDescDecompositionResponse)
-        prompt_template = ChatPromptTemplate.from_messages(
-            [
-                ('system', system_prompt_template_decompose_visual_description),
-                ('human', human_prompt_template_decompose_visual_description),
-            ]
-        )
-        chain = prompt_template | self.chat_model | parser
 
         visual_desc = shot_brief_desc.visual_desc.strip()
 
         characters_str = "\n".join([f"{char.identifier_in_scene}: (static) {char.static_features}; (dynamic) {char.dynamic_features}" for char in characters])
 
+        messages = [
+            ('system', system_prompt_template_decompose_visual_description.format(format_instructions=parser.get_format_instructions()) + self._decomposition_skill_suffix()),
+            ('human', human_prompt_template_decompose_visual_description.format(visual_desc=visual_desc, characters_str=characters_str)),
+        ]
+        chain = self.chat_model | parser
+
         decomposition: VisDescDecompositionResponse = await asyncio.wait_for(
-            chain.ainvoke(
-                input={
-                    "format_instructions": parser.get_format_instructions(),
-                    "visual_desc": visual_desc,
-                    "characters_str": characters_str,
-                },
-            ),
+            chain.ainvoke(messages),
             timeout=retry_timeout,
         )
 
@@ -257,6 +267,7 @@ class StoryboardArtist:
             lf_vis_char_idxs=decomposition.lf_vis_char_idxs,
             motion_desc=decomposition.motion_desc,
             audio_desc=shot_brief_desc.audio_desc,
+            duration_seconds=shot_brief_desc.duration_seconds,
         )
 
 

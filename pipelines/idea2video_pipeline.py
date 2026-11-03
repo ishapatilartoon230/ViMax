@@ -2,7 +2,8 @@ import os
 import shutil
 import logging
 from agents import Screenwriter, CharacterExtractor, CharacterPortraitsGenerator
-from pipelines.script2video_pipeline import Script2VideoPipeline, _scoped_progress
+from agents.screenwriter import timing_contract_text
+from pipelines.script2video_pipeline import Script2VideoPipeline, _scoped_progress, _trim_video_to_seconds
 from interfaces import CharacterInScene
 from typing import Any, Callable, List, Dict, Optional
 import asyncio
@@ -11,9 +12,15 @@ import yaml
 from langchain.chat_models import init_chat_model
 from tools.render_backend import RenderBackend
 from utils.provider_presets import resolve_chat_model_config
+from utils.skills import StageSkills
+from utils.review_config import review_config_from_workspace
+
+from pathlib import Path
 from utils.text import safe_path_component
 from utils.video import concatenate_video_files
 from utils.image_selection import DEFAULT_IMAGE_CANDIDATES, image_candidate_count_from_config, validate_image_candidate_count
+from utils.render_geometry import normalize_render_geometry
+from utils.script_engagement import MAX_BOUNCES, engagement_error_message, engagement_report
 
 
 def _pipeline_print(quiet: bool, message: str) -> None:
@@ -29,19 +36,29 @@ class Idea2VideoPipeline:
         video_generator: str,
         working_dir: str,
         num_image_candidates: int = DEFAULT_IMAGE_CANDIDATES,
+        render_geometry: Optional[Dict[str, Any]] = None,
+        skills: Optional["StageSkills"] = None,
+        review_config: Optional[Dict[str, Any]] = None,
+        review_chat_model: Optional[Any] = None,
     ):
         self.chat_model = chat_model
         self.image_generator = image_generator
         self.video_generator = video_generator
         self.num_image_candidates = validate_image_candidate_count(num_image_candidates)
+        self.render_geometry = normalize_render_geometry(render_geometry)
         self.working_dir = working_dir
+        self.skills = skills
+        self.review_config = review_config
+        self.review_chat_model = review_chat_model
         os.makedirs(self.working_dir, exist_ok=True)
 
-        self.screenwriter = Screenwriter(chat_model=self.chat_model)
+        self.screenwriter = Screenwriter(chat_model=self.chat_model, screenwriter_skills=self.skills.stages("screenwriter", "script_engagement", "clip_contract") if self.skills is not None else "")
         self.character_extractor = CharacterExtractor(
-            chat_model=self.chat_model)
+            chat_model=self.chat_model,
+            extraction_skills=self.skills.stage("character_extraction") if self.skills is not None else "")
         self.character_portraits_generator = CharacterPortraitsGenerator(
-            image_generator=self.image_generator)
+            image_generator=self.image_generator,
+            portrait_skills=self.skills.stage("character_portraits") if self.skills is not None else "")
 
     @classmethod
     def init_from_config(cls, config_path: str):
@@ -58,6 +75,10 @@ class Idea2VideoPipeline:
             video_generator=backend.video_generator,
             working_dir=config["working_dir"],
             num_image_candidates=image_candidate_count_from_config(config),
+            render_geometry=config.get("render") if isinstance(config.get("render"), dict) else None,
+            skills=StageSkills(Path(config_path).resolve().parent.parent),
+            review_config=review_config_from_workspace(Path(config_path).resolve().parent.parent),
+            review_chat_model=None,
         )
 
     async def extract_characters(
@@ -155,7 +176,34 @@ class Idea2VideoPipeline:
             _pipeline_print(quiet, f"🚀 Loaded script from existing file.")
         else:
             _pipeline_print(quiet, "🧠 Writing script based on story...")
-            script = await self.screenwriter.write_script_based_on_story(story=story, user_requirement=user_requirement)
+            # The generated script is what pins per-shot timing downstream —
+            # its dialogue must be written to fit those times from the start,
+            # or the dialogue-fit gate has to rebalance the scene afterwards.
+            timing_contract = timing_contract_text(
+                video_seconds=float(self.render_geometry.get("video_seconds", 8.0)),
+                max_total_seconds=float(self.render_geometry.get("max_total_video_seconds", 40.0)),
+            )
+            script = await self.screenwriter.write_script_based_on_story(story=story, user_requirement=user_requirement, timing_contract=timing_contract)
+            # Mechanical engagement gate on the dialogue WE wrote (AI tells).
+            # Same bounce pattern as the script-fidelity gate: rewrite with the
+            # fix instruction, then proceed with a warning — engagement is
+            # quality, never a render blocker.
+            for attempt in range(MAX_BOUNCES + 1):
+                report = engagement_report("\n\n".join(script))
+                fix_instruction = engagement_error_message(report)
+                if fix_instruction is None:
+                    if report.get("soft_flags"):
+                        _pipeline_print(quiet, f"⚠️ Dialogue engagement advisory: {report['soft_flags']}")
+                    break
+                if attempt >= MAX_BOUNCES:
+                    _pipeline_print(quiet, f"⚠️ Dialogue engagement check still failing after {MAX_BOUNCES} rewrites; proceeding: {report['hard_failures'][:3]}")
+                    break
+                _pipeline_print(quiet, f"🔧 Dialogue engagement check failed (attempt {attempt + 1}); rewriting script...")
+                script = await self.screenwriter.write_script_based_on_story(
+                    story=story,
+                    user_requirement=(user_requirement or "") + f"\n\n[Dialogue engagement feedback — fix these issues:\n{fix_instruction}]",
+                    timing_contract=timing_contract,
+                )
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(script, f, ensure_ascii=False, indent=4)
             _pipeline_print(quiet, f"✅ Written script based on story and saved to {save_path}.")
@@ -256,6 +304,10 @@ class Idea2VideoPipeline:
                 video_generator=self.video_generator,
                 working_dir=scene_working_dir,
                 num_image_candidates=self.num_image_candidates,
+                render_geometry=self.render_geometry,
+                skills=self.skills,
+                review_config=self.review_config,
+                review_chat_model=self.review_chat_model,
             )
             final_video_path = await script2video_pipeline(
                 script=scene_script,
@@ -274,5 +326,8 @@ class Idea2VideoPipeline:
         else:
             _pipeline_print(quiet, f"🎬 Starting concatenating videos...")
             concatenate_video_files(all_video_paths, final_video_path)
+            max_total = float(self.render_geometry.get("max_total_video_seconds", 40.0))
+            if _trim_video_to_seconds(final_video_path, max_total):
+                _pipeline_print(quiet, f"✂️ Trimmed final video to the {max_total:g}s limit.")
             _pipeline_print(quiet, f"☑️ Concatenated videos, saved to {final_video_path}.")
         return final_video_path

@@ -73,8 +73,9 @@ class BestImageSelector:
         base_url: str | None = None,
         api_key: str | None = None,
         chat_model: str | BaseChatModel | None = None,
+        selection_skills: str = "",
     ):
-        
+
         if chat_model is None:
             raise ValueError("A vision-capable chat_model is required for image selection")
         if isinstance(chat_model, str):
@@ -86,6 +87,10 @@ class BestImageSelector:
             )
         else:
             self.chat_model = chat_model
+        self.selection_skills = (selection_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n{self.selection_skills}" if self.selection_skills else ""
 
 
     async def __call__(
@@ -164,7 +169,7 @@ class BestImageSelector:
                 format_instructions=parser.get_format_instructions(),
                 candidate_count=len(candidate_image_paths),
                 candidate_max_index=len(candidate_image_paths) - 1,
-            )),
+            ) + self._skill_suffix()),
             HumanMessage(content=human_content)
         ]
 

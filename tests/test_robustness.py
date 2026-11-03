@@ -51,7 +51,9 @@ class TestLLMClient(unittest.IsolatedAsyncioTestCase):
     async def test_retries_rate_limit_then_succeeds(self):
         create = AsyncMock(side_effect=[FakeStatusError(429), _fake_completion("recovered")])
         llm = self._llm(create)
-        result = await llm.complete([{"role": "user", "content": "x"}], tools=[])
+        # Keep the 429 wait tiny under test; production honors the server delay.
+        with patch.dict("os.environ", {"VIMAX_LLM_429_MAX_WAIT_SECONDS": "5"}):
+            result = await llm.complete([{"role": "user", "content": "x"}], tools=[])
         self.assertEqual(result.text, "recovered")
         self.assertEqual(create.await_count, 2)
 

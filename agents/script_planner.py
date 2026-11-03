@@ -336,6 +336,7 @@ class ScriptPlanner:
         base_url: str,
         api_key: str,
         model_provider: str = "openai",
+        planning_skills: str = "",
     ):
         self.chat_model = init_chat_model(
             model=chat_model,
@@ -343,6 +344,10 @@ class ScriptPlanner:
             base_url=base_url,
             api_key=api_key,
         )
+        self.planning_skills = (planning_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n[Project Skills]\n{self.planning_skills}" if self.planning_skills else ""
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, max=30), after=after_func)
     def plan_script(
@@ -409,22 +414,15 @@ class ScriptPlanner:
 
         system_template = get_system_template(chosen_intent)
 
-        planning_prompt_template = ChatPromptTemplate.from_messages(
-            [
-                ('system', system_template),
-                ('human', human_prompt_template_script_planner),
-            ]
-        )
-        planning_chain = planning_prompt_template | self.chat_model | planning_parser
+        planning_messages = [
+            ('system', system_template.format(format_instructions=planning_parser.get_format_instructions()) + self._skill_suffix()),
+            ('human', human_prompt_template_script_planner.format(basic_idea=basic_idea)),
+        ]
+        planning_chain = self.chat_model | planning_parser
 
         try:
             logging.info(f"Planning script from basic idea: {basic_idea[:100]}...")
-            response = planning_chain.invoke(
-                {
-                    "format_instructions": planning_parser.get_format_instructions(),
-                    "basic_idea": basic_idea,
-                }
-            )
+            response = planning_chain.invoke(planning_messages)
             logging.info("Script planning completed.")
             return response
         except Exception as e:

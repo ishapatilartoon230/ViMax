@@ -117,12 +117,42 @@ human_prompt_template_write_script_based_on_story = \
 """
 
 
+def timing_contract_text(video_seconds: float, max_total_seconds: float, max_shot_seconds: float = 60.0) -> str:
+    """Concrete timing limits the script must obey, with the speech arithmetic.
+
+    The script this writer produces is rendered as real video clips: dialogue
+    is spoken by the video model at a natural pace and every clip is trimmed
+    to its stated duration. A line that cannot finish inside its shot is cut
+    mid-sentence, so the writer must budget words to seconds up front — the
+    same way hosted video tools fit speech inside a requested clip length.
+    """
+    example_words = int(video_seconds * 2.8 * (1.0 - 0.15))
+    return (
+        "\n[Timing Contract]\n"
+        "This script will be rendered as real video with hard timing limits. Obey exactly:\n"
+        f"- Each shot is a clip of {video_seconds:g}s by default. You may state a different duration per shot "
+        f'("Duration: Ns", maximum {max_shot_seconds:g}s per shot) when the beat needs it.\n'
+        f"- The whole scene must total at most {max_total_seconds:g}s.\n"
+        "- Dialogue is spoken at a natural conversational pace of about 2.8 words per second plus 0.3s of pause between "
+        "consecutive lines: a shot of N seconds fits at most (N - 0.3 x (L-1)) x 2.8 words of dialogue "
+        f"across L quoted lines (a {video_seconds:g}s shot with a single line holds about {example_words} words).\n"
+        "- Before finalizing each shot, count its dialogue words against its duration. If the lines cannot "
+        "finish inside the shot, write shorter lines or move them to another shot — never write dialogue "
+        "that will be cut mid-sentence.\n"
+    )
+
+
 class Screenwriter:
     def __init__(
         self,
         chat_model: str,
+        screenwriter_skills: str = "",
     ):
         self.chat_model = chat_model
+        self.screenwriter_skills = (screenwriter_skills or "").strip()
+
+    def _skill_suffix(self) -> str:
+        return f"\n{self.screenwriter_skills}" if self.screenwriter_skills else ""
 
     async def develop_story(
         self,
@@ -130,7 +160,7 @@ class Screenwriter:
         user_requirement: Optional[str] = None,
     ) -> str:
         messages = [
-            ("system", system_prompt_template_develop_story),
+            ("system", system_prompt_template_develop_story + self._skill_suffix()),
             ("human", human_prompt_template_develop_story.format(idea=idea, user_requirement=user_requirement)),
         ]
         response = await self.chat_model.ainvoke(messages)
@@ -143,6 +173,7 @@ class Screenwriter:
         self,
         story: str,
         user_requirement: Optional[str] = None,
+        timing_contract: str = "",
     ) -> List[str]:
 
 
@@ -156,7 +187,7 @@ class Screenwriter:
         format_instructions = parser.get_format_instructions()
 
         messages = [
-            ("system", system_prompt_template_write_script_based_on_story.format(format_instructions=format_instructions)),
+            ("system", system_prompt_template_write_script_based_on_story.format(format_instructions=format_instructions) + (timing_contract or "") + self._skill_suffix()),
             ("human", human_prompt_template_write_script_based_on_story.format(story=story, user_requirement=user_requirement)),
         ]
         response = await self.chat_model.ainvoke(messages)
