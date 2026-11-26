@@ -31,3 +31,6 @@ AGENTS.md
 project_plan/
 project_working/
 user_idea/
+
+# Local fix log (date-wise problem/fix notes)
+fixlog/

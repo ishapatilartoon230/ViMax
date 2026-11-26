@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -15,6 +16,57 @@ from .tool_executor import ToolExecutor
 from .tools import ToolRegistry, build_builtin_registry
 
 MAX_TOOL_PASSES = 50
+
+
+def _tool_result_max_chars() -> int:
+    """Char cap for tool results injected into the LLM context.
+
+    One giant tool result (a 365MB log read) can leapfrog every preflight
+    threshold in a single round and hard-fail the provider with a 400 that
+    compaction cannot fix (the fat message sits in the preserved tail).
+    """
+    try:
+        return max(1_000, int(os.environ.get("VIMAX_TOOL_RESULT_MAX_CHARS", "24000")))
+    except ValueError:
+        return 24_000
+
+
+def _clip_tool_content(text: str) -> str:
+    limit = _tool_result_max_chars()
+    if len(text) <= limit:
+        return text
+    notice = (
+        f"\n...[tool result truncated to stay inside the model context limit: first {limit} of {len(text)} chars kept; "
+        "read specific ranges or grep the file instead of loading it whole]"
+    )
+    return text[:limit] + notice
+
+
+def _is_image_message(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    return isinstance(content, list) and any(part.get("type") == "image_url" for part in content if isinstance(part, dict))
+
+
+def _strip_stale_images(messages: list[dict[str, Any]], *, keep_last: int = 1) -> None:
+    """Drop image payloads from all but the newest image message(s), in place.
+
+    Inline base64 images are counted as text tokens by some gateways; a couple
+    of full-resolution views can blow the input limit on their own.
+    """
+    indices = [i for i, message in enumerate(messages) if _is_image_message(message)]
+    for i in indices[: max(0, len(indices) - max(0, keep_last))]:
+        messages[i] = {
+            "role": "user",
+            "content": "[Tool-provided image(s) from an earlier round were removed from context to stay within the "
+            "model input limit. Re-run view_image on the path if those pixels are still needed.]",
+        }
+
+
+def _shrink_oversized_tool_messages(messages: list[dict[str, Any]]) -> None:
+    """Apply the tool-result cap to messages already in the context, in place."""
+    for i, message in enumerate(messages):
+        if message.get("role") == "tool" and isinstance(message.get("content"), str):
+            messages[i] = {**message, "content": _clip_tool_content(message["content"])}
 
 
 def _is_context_limit_error(exc: BaseException) -> bool:
@@ -110,16 +162,20 @@ class AgentLoop:
                 assistant = await self.llm.complete(runtime_messages, tools=tool_schemas)
             except Exception as exc:
                 if _is_context_limit_error(exc) and not context_recovered:
-                    # The provider refused the input as too large: compact this
-                    # turn's runtime messages once and retry sampling instead of
-                    # failing the whole turn.
+                    # The provider refused the input as too large. Shrink the
+                    # fat payloads FIRST (giant tool results, stale images) —
+                    # they usually sit in the compactor's preserved tail, so
+                    # compaction alone cannot remove them and every retry
+                    # would fail with the same 400.
                     context_recovered = True
-                    yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Context limit hit; compacting and retrying"}
+                    yield {"type": "status", "turn_id": control.turn_id, "phase": "compact", "message": "Context limit hit; shrinking oversized content and retrying"}
+                    _strip_stale_images(runtime_messages, keep_last=0)
+                    _shrink_oversized_tool_messages(runtime_messages)
                     try:
                         runtime_messages = await self._compact_runtime_messages(runtime_messages, system, reason="context-limit-recovery")
-                        continue
                     except Exception:
                         pass
+                    continue
                 status = "failed"
                 final_text = f"Agent LLM request failed: {exc}"
                 transitions.append(_transition("sampling_assistant", "finalizing_answer", "llm_sampling_failed"))
@@ -165,10 +221,13 @@ class AgentLoop:
                 round_results.append(result)
                 all_tool_results.append(result)
                 yield {"type": "tool_result", "turn_id": control.turn_id, "tool_result": result.as_dict()}
-                runtime_messages.append({"role": "tool", "tool_call_id": call.id, "name": result.name, "content": json.dumps(result.as_dict(), ensure_ascii=False)})
+                runtime_messages.append({"role": "tool", "tool_call_id": call.id, "name": result.name, "content": _clip_tool_content(json.dumps(result.as_dict(), ensure_ascii=False))})
                 if result.model_content:
                     round_model_content.extend(result.model_content)
             if round_model_content:
+                # Only the newest round keeps its pixels: older image payloads
+                # count as text tokens on several gateways and would pile up.
+                _strip_stale_images(runtime_messages, keep_last=0)
                 runtime_messages.append(
                     {
                         "role": "user",

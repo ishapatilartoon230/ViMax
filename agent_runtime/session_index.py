@@ -36,6 +36,55 @@ def _path_lock(key: str) -> threading.RLock:
 STALE_KEYS = ["story", "characters", "script", "storyboard", "shot_descriptions", "camera_tree", "frames", "clips", "final_video"]
 
 
+def _log_rotate_bytes() -> int:
+    try:
+        return max(1_000_000, int(os.environ.get("VIMAX_LOG_ROTATE_BYTES", "100000000")))
+    except ValueError:
+        return 100_000_000
+
+
+def _slim_turn_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Drop fat payloads before writing a turn to the shared loop log.
+
+    Full tool results (whole-file reads of giant logs/JSON) grew
+    loop_history.jsonl to 365MB; the web UI and the agent's own log reads
+    then dragged megabytes into memory/context. Keep previews only — full
+    artifacts live in .working_dir and the turn's event stream.
+    """
+    slim = dict(record)
+    rounds = []
+    for round_item in slim.get("tool_rounds") or []:
+        if not isinstance(round_item, dict):
+            rounds.append(round_item)
+            continue
+        results = []
+        for result in round_item.get("tool_results") or []:
+            if not isinstance(result, dict):
+                results.append(result)
+                continue
+            item = dict(result)
+            item.pop("model_content", None)
+            content = item.get("content")
+            if isinstance(content, str) and len(content) > 600:
+                item["content"] = content[:600] + "...[clipped in log]"
+            results.append(item)
+        rounds.append({**round_item, "tool_results": results})
+    if rounds:
+        slim["tool_rounds"] = rounds
+    turns = []
+    for turn in slim.get("assistant_turns") or []:
+        if isinstance(turn, dict) and isinstance(turn.get("text"), str) and len(turn["text"]) > 2000:
+            turn = {**turn, "text": turn["text"][:2000] + "...[clipped in log]"}
+        turns.append(turn)
+    if turns:
+        slim["assistant_turns"] = turns
+    if isinstance(slim.get("final_assistant_text"), str) and len(slim["final_assistant_text"]) > 2000:
+        slim["final_assistant_text"] = slim["final_assistant_text"][:2000] + "...[clipped in log]"
+    if isinstance(slim.get("raw_user_input"), str) and len(slim["raw_user_input"]) > 8000:
+        slim["raw_user_input"] = slim["raw_user_input"][:8000] + "...[clipped in log]"
+    return slim
+
+
 def _synchronized(method):
     """Hold the index file lock across a read-modify-write cycle.
 
@@ -283,7 +332,7 @@ class SessionIndex:
             session["recent_turn_records"] = recent[-6:]
             session["updated_at"] = datetime.now().isoformat(timespec="seconds")
             self.save(data)
-        self.append_log("loop_history", {"session_id": session_id, **record})
+        self.append_log("loop_history", {"session_id": session_id, **_slim_turn_record(record)})
 
     def working_dir(self, session_id: str | None = None) -> Path:
         record = self.get(session_id) if session_id else self.active()
@@ -348,8 +397,36 @@ class SessionIndex:
     def append_log(self, name: str, payload: dict[str, Any]) -> None:
         event = {"timestamp": datetime.now().isoformat(timespec="seconds"), **payload}
         path = self.logs_dir / f"{name}.jsonl"
+        self._archive_log_if_stale(path)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+
+    @staticmethod
+    def _archive_log_if_stale(path: Path) -> None:
+        """Date-wise logs: archive the current file once its day is over.
+
+        Everything used to append into one loop_history.jsonl forever (it
+        reached 365MB). Now, on the first append of a new day — or when the
+        file outgrows the size cap — the existing file is moved to
+        <name>-<YYYY-MM-DD>.jsonl and a fresh <name>.jsonl starts. Readers
+        merge <name>*.jsonl (sorted by name), so history stays complete.
+        """
+        try:
+            if not path.exists():
+                return
+            stat = path.stat()
+            file_time = datetime.fromtimestamp(stat.st_mtime)
+            now = datetime.now()
+            stale = file_time.date() != now.date() or stat.st_size > _log_rotate_bytes()
+            if not stale:
+                return
+            stamp = file_time.strftime("%Y-%m-%d")
+            archive = path.with_name(f"{path.stem}-{stamp}{path.suffix}")
+            if archive.exists():
+                archive = path.with_name(f"{path.stem}-{stamp}-{file_time.strftime('%H%M%S')}{path.suffix}")
+            path.rename(archive)
+        except OSError:
+            pass
 
     def snapshot(self) -> dict[str, Any]:
         active = self.active()

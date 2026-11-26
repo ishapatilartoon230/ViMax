@@ -31,6 +31,6 @@
 - Prop state is progressive: what earlier shots tapped/played stays that way later.
 
 ## Continuity across shots
-- Characters keep wardrobe and screen position between adjacent shots unless shown changing; adjacent shots hand over world state (objects moved, screens changed, cards played).
+- Characters keep wardrobe and screen position unless shown changing; adjacent shots hand over world state (objects moved, screens changed, cards played).
 - Eyelines match what characters look at; off-camera speakers are never visualized.
-- Reuse an established camera position; add one only for a genuinely different size/angle/focus. Compose for the target aspect ratio (portrait frames compose vertically).
+- Every shot renders chained from the previous clip's real last frame (camera changes too) — a new angle is a described re-frame, not a new scene. Compose for the target aspect ratio (portrait frames compose vertically).

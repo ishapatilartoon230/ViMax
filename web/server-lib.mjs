@@ -48,9 +48,22 @@ export async function deleteSession(repoRoot, sessionId) {
 
 export async function readSessionHistory(repoRoot, sessionId) {
   assertSessionId(sessionId);
-  const logPath = path.join(repoRoot, '.vimax', 'logs', 'loop_history.jsonl');
+  // Logs are archived date-wise (loop_history-YYYY-MM-DD.jsonl) alongside the
+  // live loop_history.jsonl; merge them oldest-first so history stays complete.
+  const logsDir = path.join(repoRoot, '.vimax', 'logs');
+  let logFiles = [];
   try {
-    const lines = (await readFile(logPath, 'utf8')).split(/\r?\n/).filter(Boolean);
+    logFiles = (await readdir(logsDir))
+      .filter((name) => /^loop_history.*\.jsonl$/.test(name))
+      .sort();
+  } catch {
+    return [];
+  }
+  try {
+    const chunks = await Promise.all(
+      logFiles.map((name) => readFile(path.join(logsDir, name), 'utf8').catch(() => '')),
+    );
+    const lines = chunks.join('\n').split(/\r?\n/).filter(Boolean);
     const messages = [];
     for (const line of lines) {
       let record;

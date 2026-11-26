@@ -160,9 +160,10 @@ class RenderDurationGateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ChainedFrameGenerationTests(unittest.IsolatedAsyncioTestCase):
-    """Flow-style chain: within a camera, only the FIRST shot's keyframe is
-    generated; later shots' first frames come from the previous clip's end
-    frame (copied in the video phase)."""
+    """Flow-style chain: only the FIRST shot's keyframe is generated; later
+    shots' first frames come from the previous clip's end frame (copied in
+    the video phase). Last frames are NEVER pre-generated — each clip's real
+    end frame is extracted after its video exists."""
 
     def _pipeline(self, tmp: str) -> Script2VideoPipeline:
         from interfaces.shot_description import ShotDescription
@@ -177,7 +178,7 @@ class ChainedFrameGenerationTests(unittest.IsolatedAsyncioTestCase):
         pipeline.frame_events = self.events
         return pipeline
 
-    async def test_chained_camera_generates_only_the_first_keyframe(self):
+    async def test_chained_camera_generates_no_last_frame_anchors(self):
         from interfaces.camera import Camera
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -197,9 +198,12 @@ class ChainedFrameGenerationTests(unittest.IsolatedAsyncioTestCase):
             camera = Camera(idx=0, active_shot_idxs=[0, 1])
             await pipeline.generate_frames_for_single_camera(camera=camera, shot_descriptions=self.descriptions, characters=[], character_portraits_registry={}, priority_shot_idxs=[])
 
-            # medium shot 0: last_frame anchor generated; shot 1 first frame NOT generated
-            self.assertEqual([call[:2] for call in calls], [(0, "last_frame")])
+            # medium shot 0 with a pre-existing first frame: NOTHING is generated —
+            # last frames are never pre-generated in chained mode (they come from
+            # the real videos afterwards), and shot 1's first frame is chained.
+            self.assertEqual(calls, [])
             self.assertTrue(self.events[1]["first_frame"].is_set())  # armed for the video phase
+            self.assertFalse(self.events[0]["last_frame"].is_set())  # never armed: nobody waits on it
 
     async def test_chained_small_first_shot_generates_nothing_extra(self):
         from interfaces.camera import Camera
@@ -307,6 +311,35 @@ class VideoChainTests(unittest.IsolatedAsyncioTestCase):
             call = generator.calls[0]
             self.assertEqual(call["references"], [str(prev_end)])  # literal continuation, own keyframe excluded
             self.assertIn("FIRST reference image is the previous", call["prompt"])
+
+    async def test_chained_medium_shot_never_waits_for_last_frame(self):
+        import asyncio
+
+        class CapturingVideoGenerator:
+            def __init__(self):
+                self.calls = []
+
+            async def generate_single_video(self, prompt, reference_image_paths, aspect_ratio=None, resolution=None, progress=None, **kwargs):
+                self.calls.append({"prompt": prompt, "references": list(reference_image_paths)})
+                return SimpleNamespace(save=lambda path: None)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = self._pipeline(tmp)
+            # No "last_frame" event exists at all — chained mode must not wait on it.
+            pipeline.frame_events = {1: {"first_frame": asyncio.Event()}}
+            pipeline.frame_events[1]["first_frame"].set()
+            shots1 = Path(tmp) / "shots" / "1"
+            shots1.mkdir(parents=True)
+            (shots1 / "last_frame.png").write_bytes(b"stale-anchor")  # must NOT be sent: last frames come from videos
+            prev_end = Path(tmp) / "shots" / "0" / "video_last_frame.png"
+            prev_end.parent.mkdir(parents=True, exist_ok=True)
+            prev_end.write_bytes(b"prev-end")
+            generator = CapturingVideoGenerator()
+            pipeline.video_generator = generator
+            shot = SimpleNamespace(idx=1, variation_type="medium", motion_desc="continues", audio_desc="", duration_seconds=4.0)
+            await pipeline.generate_video_for_single_shot(shot, previous_end_frame_path=str(prev_end))
+            self.assertEqual(len(generator.calls), 1)
+            self.assertEqual(generator.calls[0]["references"], [str(prev_end)])  # exactly one reference image
 
 
 class NoTextPromptTests(unittest.IsolatedAsyncioTestCase):

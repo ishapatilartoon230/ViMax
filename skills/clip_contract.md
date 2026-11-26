@@ -16,7 +16,7 @@ Every script ViMax writes (idea expansion, planning, enhancement, novel adaptati
 6. **Audio** — room ambience, dialogue dominant, music level underneath; no overlapping lines, no shouting, no robotic delivery.
 7. **Screen guidance** — when a device shows an app/game: "keep on-screen content minimal and generic, no readable UI text or fake interface — the screen will be replaced with real footage in editing." Never invent detailed game mechanics.
 8. **Negatives** — explicit ban list: no identity/wardrobe changes, no orientation flips, no extra or missing fingers, no new people entering, no model-generated text/logos/watermarks, no abrupt camera jumps.
-9. **End-state handoff** — the exact final pose/expression of the clip and "ready for the next clip"; the next clip starts from that moment as if recording never stopped.
+9. **End-state handoff** — the exact final pose/expression and "ready for the next clip". Each clip's first frame IS the previous clip's real last frame; describe new angles in words.
 10. **Post-production** — overlays, captions, end cards, and real screen inserts are listed for the editor, never written into the generated visuals.
 
 ## Hard rules

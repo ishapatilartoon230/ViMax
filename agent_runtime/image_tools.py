@@ -28,8 +28,11 @@ class ViewImageHandler:
             try:
                 data_url, display = _encode_for_model(
                     image,
-                    max_dimension=_env_int("VIMAX_IMAGE_VIEW_MAX_DIMENSION", 1568, minimum=256),
-                    max_bytes=_env_int("VIMAX_IMAGE_VIEW_MAX_BYTES", 5_000_000, minimum=100_000),
+                    # Some gateways count inline base64 as TEXT tokens: one
+                    # 5MB image alone measured ~1.6M tokens and killed the
+                    # turn with a 400. Keep embedded images well under that.
+                    max_dimension=_env_int("VIMAX_IMAGE_VIEW_MAX_DIMENSION", 1024, minimum=256),
+                    max_bytes=_env_int("VIMAX_IMAGE_VIEW_MAX_BYTES", 900_000, minimum=100_000),
                 )
             finally:
                 image.close()

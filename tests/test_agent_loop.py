@@ -77,6 +77,111 @@ class ContextLimitRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(done["assistant"], "done after tools")
 
 
+class ContextSafetyTests(unittest.IsolatedAsyncioTestCase):
+    """p6 (2026-11-26): a tool result dragging in a giant log file pushed the
+    request to 1.64M tokens and killed the turn with an unrecoverable 400.
+    Tool results must be capped for the LLM, and recovery must drop images."""
+
+    async def test_giant_tool_result_is_clipped_for_the_llm_but_full_in_events(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            giant = "g" * 100_000
+
+            def fat(args):
+                return ToolResult("fat", True, giant)
+
+            registry = ToolRegistry([ToolSpec("fat", "Fat result", fat, schema={})])
+            llm = CapturingLLM(
+                [
+                    AssistantMessage(tool_calls=[ToolCall(name="fat", arguments={})]),
+                    AssistantMessage(text="done"),
+                ]
+            )
+            with patch.dict("os.environ", {"VIMAX_TOOL_RESULT_MAX_CHARS": "2000"}):
+                loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+                events = [event async for event in loop.stream_events("run it")]
+            tool_messages = [message for message in llm.calls[1] if message.get("role") == "tool"]
+            self.assertEqual(len(tool_messages), 1)
+            self.assertLessEqual(len(tool_messages[0]["content"]), 2_300)
+            self.assertIn("tool result truncated", tool_messages[0]["content"])
+            event_results = [event for event in events if event["type"] == "tool_result"]
+            self.assertGreaterEqual(len(event_results[0]["tool_result"]["content"]), 100_000)
+
+    async def test_context_limit_recovery_drops_image_payloads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            data_url = "data:image/jpeg;base64," + "a" * 50_000
+
+            def view(args):
+                return ToolResult(
+                    "view_image",
+                    True,
+                    "image loaded",
+                    {"path": "frame.png"},
+                    model_content=[{"type": "image_url", "image_url": {"url": data_url, "detail": "high"}}],
+                )
+
+            registry = ToolRegistry([ToolSpec("view_image", "View image", view, schema={"path": ToolArgumentSchema(str, True)})])
+            recovery_reply = AssistantMessage(text="recovered without the pixels")
+            with patch.dict("os.environ", {"VIMAX_TOOL_RESULT_MAX_CHARS": "2000"}):
+
+                class FailOnceThenAnswer:
+                    def __init__(self, replies):
+                        self.replies = list(replies)
+                        self.calls = []
+
+                    async def complete(self, messages, tools):
+                        self.calls.append(deepcopy(messages))
+                        if len(self.calls) == 2:  # the call right after the image arrived
+                            raise ContextLimitError("Error code: 400 - input token count exceeds the maximum number of tokens allowed (1048576)")
+                        if self.replies:
+                            return self.replies.pop(0)
+                        return AssistantMessage(text="recovered without the pixels")
+
+                fail_once = FailOnceThenAnswer(
+                    [AssistantMessage(tool_calls=[ToolCall(name="view_image", arguments={"path": "frame.png"})])]
+                )
+                loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), fail_once, ContextCompactor(None))
+                events = [event async for event in loop.stream_events("inspect")]
+            done = [event for event in events if event["type"] == "done"][0]
+            self.assertEqual(done["assistant"], "recovered without the pixels")
+            retry_call = fail_once.calls[2]
+            self.assertNotIn("image_url", json.dumps(retry_call))
+            self.assertIn("removed from context", json.dumps(retry_call))
+
+    async def test_only_the_newest_image_round_keeps_its_pixels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            first_url = "data:image/jpeg;base64,Zmlyc3Q="
+            second_url = "data:image/jpeg;base64,c2Vjb25k"
+
+            def view(args):
+                url = second_url if args.get("path") == "two.png" else first_url
+                return ToolResult(
+                    "view_image",
+                    True,
+                    "image loaded",
+                    {"path": args.get("path")},
+                    model_content=[{"type": "image_url", "image_url": {"url": url, "detail": "high"}}],
+                )
+
+            registry = ToolRegistry([ToolSpec("view_image", "View image", view, schema={"path": ToolArgumentSchema(str, True)})])
+            llm = CapturingLLM(
+                [
+                    AssistantMessage(tool_calls=[ToolCall(name="view_image", arguments={"path": "one.png"})]),
+                    AssistantMessage(tool_calls=[ToolCall(name="view_image", arguments={"path": "two.png"})]),
+                    AssistantMessage(text="both inspected"),
+                ]
+            )
+            loop = AgentLoop(index, PromptBuilder(f"{tmp}/prompts", index, registry), registry, ToolExecutor(registry, index), llm)
+            [event async for event in loop.stream_events("inspect both")]
+            third_call = llm.calls[2]
+            image_messages = [message for message in third_call if message.get("role") == "user" and isinstance(message.get("content"), list)]
+            self.assertEqual(len(image_messages), 1)
+            self.assertEqual(image_messages[0]["content"][1]["image_url"]["url"], second_url)
+            self.assertIn("removed from context", json.dumps(third_call))
+
+
 class FakeLLM:
     def __init__(self, replies):
         self.replies = list(replies)

@@ -99,6 +99,10 @@ def resolve_render_geometry(workspace_root: Union[str, Path, None] = None) -> Di
         geometry["allow_portrait"] = env_allow in _TRUTHY
     else:
         geometry["allow_portrait"] = _as_bool(section.get("allow_portrait"))
+    # chain_frames (default true): strict serial chain — every clip starts
+    # from the previous clip's extracted end frame (camera changes included);
+    # only shot 0 gets a generated keyframe. False restores independent
+    # per-shot keyframes with the camera tree.
     env_chain = os.environ.get("VIMAX_CHAIN_FRAMES", "").strip().lower()
     if env_chain:
         geometry["chain_frames"] = env_chain in _TRUTHY

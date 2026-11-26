@@ -652,36 +652,49 @@ class Script2VideoPipeline:
         )
         _emit_render_progress(progress, "shot_descriptions_ready", "Shot descriptions ready", {"shot_count": len(shot_descriptions)})
 
-        # construct camera tree
-        _emit_render_progress(progress, "load_camera_tree", "Loading or constructing camera tree", {"shot_count": len(shot_descriptions)})
-        camera_tree = await self.construct_camera_tree(
-            shot_descriptions=shot_descriptions,
-            quiet=quiet,
-        )
-        _emit_render_progress(progress, "camera_tree_ready", "Camera tree ready", {"camera_count": len(camera_tree)})
-
-        priority_shot_idxs = [camera.parent_cam_idx for camera in camera_tree if camera.parent_cam_idx is not None]
-        _emit_render_progress(progress, "frames_start", "Generating frames for cameras", {"camera_count": len(camera_tree), "shot_count": len(shot_descriptions)})
-        tasks = [
-            self.generate_frames_for_single_camera(
-                camera=camera,
+        _emit_render_progress(progress, "video_clips_start", "Generating video clips for shots", {"shot_count": len(shot_descriptions)})
+        if bool(self.render_geometry.get("chain_frames", True)):
+            # Strict chain mode: ONE generated keyframe for the whole video
+            # (shot 0, anchored on the character portraits). Every later
+            # shot's first frame is the previous clip's real end frame,
+            # copied in the serial video phase - no camera tree, no
+            # transition videos, no mid-video keyframes.
+            root_camera = Camera(
+                idx=getattr(shot_descriptions[0], "cam_idx", None) or 0,
+                active_shot_idxs=[shot_description.idx for shot_description in shot_descriptions],
+            )
+            _emit_render_progress(progress, "frames_start", "Generating first keyframe for the chain", {"camera_count": 1, "shot_count": len(shot_descriptions)})
+            await self.generate_frames_for_single_camera(
+                camera=root_camera,
                 shot_descriptions=shot_descriptions,
                 characters=characters,
                 character_portraits_registry=character_portraits_registry,
-                priority_shot_idxs=priority_shot_idxs,
+                priority_shot_idxs=[],
                 progress=progress,
             )
-            for camera in camera_tree
-        ]
-
-        _emit_render_progress(progress, "video_clips_start", "Generating video clips for shots", {"shot_count": len(shot_descriptions)})
-        if bool(self.render_geometry.get("chain_frames", True)):
-            # Chained mode: finish all frame generation first (per-camera,
-            # already chained), then generate the clips strictly in order so
-            # every clip starts from the previous clip's real final frame.
-            await asyncio.gather(*tasks)
             await self._generate_all_shot_videos(shot_descriptions, progress=progress, characters=characters, character_portraits_registry=character_portraits_registry)
         else:
+            # construct camera tree
+            _emit_render_progress(progress, "load_camera_tree", "Loading or constructing camera tree", {"shot_count": len(shot_descriptions)})
+            camera_tree = await self.construct_camera_tree(
+                shot_descriptions=shot_descriptions,
+                quiet=quiet,
+            )
+            _emit_render_progress(progress, "camera_tree_ready", "Camera tree ready", {"camera_count": len(camera_tree)})
+
+            priority_shot_idxs = [camera.parent_cam_idx for camera in camera_tree if camera.parent_cam_idx is not None]
+            _emit_render_progress(progress, "frames_start", "Generating frames for cameras", {"camera_count": len(camera_tree), "shot_count": len(shot_descriptions)})
+            tasks = [
+                self.generate_frames_for_single_camera(
+                    camera=camera,
+                    shot_descriptions=shot_descriptions,
+                    characters=characters,
+                    character_portraits_registry=character_portraits_registry,
+                    priority_shot_idxs=priority_shot_idxs,
+                    progress=progress,
+                )
+                for camera in camera_tree
+            ]
             video_tasks = [
                 self.generate_video_for_single_shot(
                     shot_description=shot_description,
@@ -845,26 +858,14 @@ class Script2VideoPipeline:
         if bool(self.render_geometry.get("chain_frames", True)):
             # Shot 0 of the camera gets a generated keyframe (above). Every
             # later shot's first frame IS the previous clip's real end frame -
-            # copied in the video phase, never generated. Here we only arm the
-            # events the video phase waits on, and build last-frame anchors
-            # for medium/large variations (end conditioning).
-            for position, shot_idx in enumerate(camera.active_shot_idxs):
-                if position > 0:
-                    events = self.frame_events.setdefault(shot_idx, {})
-                    events.setdefault("first_frame", asyncio.Event()).set()
-                    _emit_render_progress(progress, "frame_from_chain", f"Shot {shot_idx} first frame chains from the previous clip's end frame", {"camera_idx": camera.idx, "shot_idx": shot_idx})
-                if shot_descriptions[shot_idx].variation_type in ["medium", "large"]:
-                    self.frame_events.setdefault(shot_idx, {}).setdefault("last_frame", asyncio.Event())
-                    await self.generate_frame_for_single_shot(
-                        shot_idx=shot_idx,
-                        frame_type="last_frame",
-                        first_shot_ff_path_and_text_pair=(first_shot_ff_path, shot_descriptions[first_shot_idx].ff_desc),
-                        frame_desc=shot_descriptions[shot_idx].lf_desc,
-                        visible_characters=[characters[idx] for idx in shot_descriptions[shot_idx].lf_vis_char_idxs],
-                        character_portraits_registry=character_portraits_registry,
-                        progress=progress,
-                        screen_guidance=getattr(shot_descriptions[shot_idx], "screen_guidance", None),
-                    )
+            # copied in the video phase, never generated. Last frames are
+            # never pre-generated either: each clip's real end frame is
+            # extracted only after its video exists. Here we only arm the
+            # events the video phase waits on.
+            for shot_idx in camera.active_shot_idxs[1:]:
+                events = self.frame_events.setdefault(shot_idx, {})
+                events.setdefault("first_frame", asyncio.Event()).set()
+                _emit_render_progress(progress, "frame_from_chain", f"Shot {shot_idx} first frame chains from the previous clip's end frame", {"camera_idx": camera.idx, "shot_idx": shot_idx})
             _emit_render_progress(progress, "camera_frames_done", f"Frames for camera {camera.idx} ready (chained)", {"camera_idx": camera.idx, "active_shot_idxs": camera.active_shot_idxs})
             return
 
@@ -929,19 +930,15 @@ class Script2VideoPipeline:
     ) -> None:
         """Serial shot chain: clip N+1 starts from clip N's real end frame.
 
-        Flow-style: for same-camera consecutive shots, the previous clip's
-        extracted end frame is copied over the next shot's first_frame.png -
-        the chain is literal pixels, no separate keyframe generation.
+        Flow-style: for EVERY shot (camera changes included), the previous
+        clip's extracted end frame is copied over the next shot's
+        first_frame.png - the chain is literal pixels, no separate keyframe
+        generation. Only shot 0 gets a generated keyframe (from the character
+        portraits, in the frame phase).
         """
         previous_end_frame_path: Optional[str] = None
-        previous_cam_idx: Optional[int] = None
         for position, shot_description in enumerate(shot_descriptions):
-            same_camera = (
-                position > 0
-                and previous_cam_idx is not None
-                and getattr(shot_description, "cam_idx", None) == previous_cam_idx
-            )
-            if same_camera:
+            if position > 0:
                 if previous_end_frame_path is not None:
                     self._chain_first_frame_from_previous_clip(shot_description.idx, previous_end_frame_path)
                 first_frame_path = os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "first_frame.png")
@@ -952,10 +949,7 @@ class Script2VideoPipeline:
                     await self.generate_frame_for_single_shot(
                         shot_idx=shot_description.idx,
                         frame_type="first_frame",
-                        first_shot_ff_path_and_text_pair=(
-                            os.path.join(self.working_dir, "shots", f"{shot_descriptions[position - 1].idx}", "first_frame.png"),
-                            getattr(shot_description, "ff_desc", ""),
-                        ),
+                        first_shot_ff_path_and_text_pair=self._previous_state_pair(shot_descriptions[position - 1].idx),
                         frame_desc=getattr(shot_description, "ff_desc", ""),
                         visible_characters=[
                             characters[i] for i in (getattr(shot_description, "ff_vis_char_idxs", None) or [])
@@ -972,7 +966,6 @@ class Script2VideoPipeline:
             )
             video_path = os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "video.mp4")
             previous_end_frame_path = self._ensure_video_end_frame(video_path, shot_description.idx)
-            previous_cam_idx = getattr(shot_description, "cam_idx", None)
 
     def _chain_first_frame_from_previous_clip(self, shot_idx: int, previous_end_frame_path: str) -> None:
         """Copy the previous clip's real end frame over this shot's keyframe.
@@ -1001,21 +994,29 @@ class Script2VideoPipeline:
         else:
             _emit_render_progress(progress, "video_clip_waiting_for_frames", f"Waiting for frames before video clip {shot_description.idx}", {"shot_idx": shot_description.idx})
             await self.frame_events[shot_description.idx]["first_frame"].wait()
-            if shot_description.variation_type in ["medium", "large"]:
+            chained_mode = bool(self.render_geometry.get("chain_frames", True))
+            if not chained_mode and shot_description.variation_type in ["medium", "large"]:
                 await self.frame_events[shot_description.idx]["last_frame"].wait()
 
             frame_paths = []
             own_last_frame = os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "last_frame.png")
+            # Chained mode never pre-generates last frames: the clip's real
+            # end state is whatever the video produces, extracted afterwards.
+            use_own_last_frame = (
+                not chained_mode
+                and shot_description.variation_type in ["medium", "large"]
+                and os.path.exists(own_last_frame)
+            )
             if previous_end_frame_path and os.path.exists(previous_end_frame_path):
                 # Exact continuation chain: the previous clip's real end frame IS
                 # this clip's first frame — the video starts from those pixels,
                 # never a blend with this shot's own keyframe.
                 frame_paths.append(previous_end_frame_path)
-                if shot_description.variation_type in ["medium", "large"] and os.path.exists(own_last_frame):
+                if use_own_last_frame:
                     frame_paths.append(own_last_frame)
             else:
                 frame_paths.append(os.path.join(self.working_dir, "shots", f"{shot_description.idx}", "first_frame.png"))
-                if shot_description.variation_type in ["medium", "large"] and os.path.exists(own_last_frame):
+                if use_own_last_frame:
                     frame_paths.append(own_last_frame)
 
             print(f"🎬 Starting video generation for shot {shot_description.idx}...")
@@ -1030,9 +1031,19 @@ class Script2VideoPipeline:
             )
             video_output.save(video_path)
             self._ensure_video_end_frame(video_path, shot_description.idx)
+            raw_delivered = self._probe_duration(video_path)
+            if raw_delivered is not None and raw_delivered - shot_seconds > 0.75:
+                overrun = round(raw_delivered - shot_seconds, 2)
+                print(f"⚠️ Shot {shot_description.idx} clip delivered {raw_delivered:.2f}s for a {shot_seconds:g}s budget ({overrun:g}s over) — trimming will cut the tail (possibly the last spoken line).")
+                _emit_render_progress(
+                    progress,
+                    "clip_over",
+                    f"Video clip for shot {shot_description.idx} overran its budget and will be trimmed",
+                    {"shot_idx": shot_description.idx, "requested_seconds": shot_seconds, "delivered_seconds": round(raw_delivered, 2), "over_by_seconds": overrun},
+                )
             if _trim_video_to_seconds(video_path, shot_seconds):
                 print(f"✂️ Trimmed video for shot {shot_description.idx} to the {shot_seconds:g}s budget.")
-                _emit_render_progress(progress, "video_clip_trimmed", f"Trimmed video clip for shot {shot_description.idx} to budget", {"shot_idx": shot_description.idx, "seconds": shot_seconds, "path": video_path})
+                _emit_render_progress(progress, "video_clip_trimmed", f"Trimmed video clip for shot {shot_description.idx} to budget", {"shot_idx": shot_description.idx, "seconds": shot_seconds, "path": video_path, "delivered_seconds": round(raw_delivered, 2) if raw_delivered is not None else None})
             delivered = self._probe_duration(video_path)
             if delivered is not None and shot_seconds - delivered > 0.5:
                 shortfall = round(shot_seconds - delivered, 2)
@@ -1314,6 +1325,53 @@ class Script2VideoPipeline:
             )
         return locks
 
+    @staticmethod
+    def _distinct_speakers(audio_desc: Any) -> List[str]:
+        """Distinct [Speaker] names in an audio_desc, in order of first line."""
+        names: List[str] = []
+        for match in re.findall(r"\[Speaker\]\s*([^\n:(]+)", str(audio_desc or "")):
+            name = match.strip()
+            if name and name.lower() not in {existing.lower() for existing in names}:
+                names.append(name)
+        return names
+
+    def _fallback_voice_features(self, character: Any) -> Optional[str]:
+        """Derive a minimal voice identity when the extractor left voice_features empty.
+
+        Without ANY voice description the video model freely swaps speakers
+        (p4: the off-camera family line came out in Grandma's voice). Age and
+        gender cues from the character's own description are enough to pin the
+        voice; a generic consistency line is the last resort.
+        """
+        name = str(getattr(character, "identifier_in_scene", "") or "")
+        static = str(getattr(character, "static_features", "") or "")
+        text = f"{name} {static}".lower()
+        feminine = any(word in text for word in ("woman", "female", "girl", "grandma", "grandmother", "mother", "sister", "aunt", "lady"))
+        masculine = not feminine and any(word in text for word in ("man", "male", "boy", "grandpa", "grandfather", "father", "brother", "uncle"))
+        age_match = re.search(r"(\d{1,3})\s*[- ]?year", text)
+        if age_match:
+            age = f"about {age_match.group(1)} years old"
+        elif any(word in text for word in ("elderly", "senior", "grandma", "grandmother", "grandpa", "grandfather")):
+            age = "elderly"
+        elif any(word in text for word in ("young", "teen", "child", "kid")):
+            age = "young"
+        else:
+            age = ""
+        gender = "feminine" if feminine else ("masculine" if masculine else "")
+        if gender and age:
+            return (
+                f"a {gender} voice ({age}) with a natural, age-appropriate timbre and steady pitch — the same "
+                "voice on every line, never a different age or gender of voice"
+            )
+        if gender:
+            return (
+                f"a {gender} voice with a natural timbre and steady pitch — the same voice on every line, "
+                "never a different gender of voice"
+            )
+        if age:
+            return f"a voice matching a person who is {age} — steady pitch, the same voice on every line"
+        return "one consistent natural voice matching this character — never a different voice on any line"
+
     def _voice_lock_text(self, shot_description: Any) -> str:
         """Voice-identity continuity for speaking characters (Flow 'VOICE LOCK')."""
         def _idxs(shot: Any, attr: str) -> List[int]:
@@ -1325,7 +1383,7 @@ class Script2VideoPipeline:
         for idx in wanted:
             if not isinstance(idx, int) or not 0 <= idx < len(characters):
                 continue
-            voice = getattr(characters[idx], "voice_features", None)
+            voice = getattr(characters[idx], "voice_features", None) or self._fallback_voice_features(characters[idx])
             if voice:
                 name = getattr(characters[idx], "identifier_in_scene", f"character {idx}")
                 lines.append(f"{name}: {voice}")
@@ -1384,7 +1442,18 @@ class Script2VideoPipeline:
             prompt += (
                 "\nThis shot continues directly from the previous shot: the FIRST reference image is the previous "
                 "shot's final frame — the video must begin exactly at that visual state (same pose, wardrobe, prop "
-                "and screen state, same framing) and never jump back in time."
+                "and screen state, same framing) and never jump back in time. "
+                "[Color lock] Keep the reference frame's exact color grade: the same white balance, exposure, "
+                "contrast, saturation and skin tone as the reference — never re-grade, wash out, soften, darken, "
+                "or shift the palette warmer or cooler; the person, garments and room must look identical to the "
+                "reference frame."
+            )
+        speakers = self._distinct_speakers(_field("audio_desc"))
+        if len(speakers) > 1:
+            prompt += (
+                f"\n[Pacing] {len(speakers)} different speakers share this one clip — deliver their lines "
+                "back-to-back with only a brief natural pause (well under a second) between them; no long "
+                "silences; every line must be fully spoken inside the clip duration."
             )
         is_last = shot_description.get("is_last") if isinstance(shot_description, dict) else getattr(shot_description, "is_last", False)
         if not is_last:

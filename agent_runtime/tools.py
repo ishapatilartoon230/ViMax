@@ -17,6 +17,19 @@ from .models import ToolCall, ToolResult
 ToolHandler = Callable[..., Awaitable[ToolResult] | ToolResult]
 ProgressCallback = Callable[[dict[str, Any]], None]
 
+# Context bombs (p6, 2026-11-26): read_file on .vimax/logs/loop_history.jsonl
+# (365MB) pushed a single tool result to 1.6M tokens and killed the turn with
+# an unrecoverable 400. Bound every path that returns file/log content.
+_MAX_VIRTUAL_LOG_ROWS = 200
+_MAX_LOG_LINE_CHARS = 50_000
+
+
+def _read_file_max_chars() -> int:
+    try:
+        return max(1_000, int(os.environ.get("VIMAX_READ_FILE_MAX_CHARS", "200000")))
+    except ValueError:
+        return 200_000
+
 
 @dataclass(slots=True)
 class ToolArgumentSchema:
@@ -224,27 +237,43 @@ def build_builtin_registry(workspace_root: str | Path, session_index: Any, adapt
         if len(parts) == 3 and parts[0] == ".vimax" and parts[1] == "logs" and parts[2].endswith(".log"):
             session_id = parts[2][:-4]
             rows: list[dict[str, Any]] = []
+            truncated_logs = False
             for log_name in ("loop_history", "tool_calls", "revisions"):
-                log_path = session_index.logs_dir / f"{log_name}.jsonl"
-                if not log_path.exists():
-                    continue
-                for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
-                    if session_id not in line:
-                        continue
-                    try:
-                        item = json.loads(line)
-                    except json.JSONDecodeError:
-                        item = {"raw": line}
-                    item["_log"] = log_name
-                    rows.append(item)
+                # Logs are archived date-wise (<name>-YYYY-MM-DD.jsonl) plus the
+                # live <name>.jsonl; read them merged, oldest first. Stream
+                # instead of read_text(): the files can still be large, and
+                # unbounded matches would blow the agent's own context.
+                log_paths = sorted(session_index.logs_dir.glob(f"{log_name}*.jsonl"))
+                for log_path in log_paths:
+                    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                        for line in handle:
+                            if session_id not in line:
+                                continue
+                            if len(line) > _MAX_LOG_LINE_CHARS:
+                                line = line[:_MAX_LOG_LINE_CHARS] + "...[line clipped]"
+                                truncated_logs = True
+                            try:
+                                item = json.loads(line)
+                            except json.JSONDecodeError:
+                                item = {"raw": line}
+                            item["_log"] = log_path.name
+                            rows.append(item)
+                            if len(rows) >= _MAX_VIRTUAL_LOG_ROWS:
+                                truncated_logs = True
+                                break
+                    if len(rows) >= _MAX_VIRTUAL_LOG_ROWS:
+                        break
+                if len(rows) >= _MAX_VIRTUAL_LOG_ROWS:
+                    break
             payload = {
                 "session_id": session_id,
                 "source": ".vimax/logs/*.jsonl",
                 "virtual_path": rel.as_posix(),
+                "truncated_to_most_recent": truncated_logs,
                 "records": rows,
             }
             content = json.dumps(payload, ensure_ascii=False, indent=2)
-            return ToolResult("read_json" if as_json else "read_file", True, content, {"virtual_path": True, "source": ".vimax/logs/*.jsonl", "record_count": len(rows)})
+            return ToolResult("read_json" if as_json else "read_file", True, content, {"virtual_path": True, "source": ".vimax/logs/*.jsonl", "record_count": len(rows), "truncated": truncated_logs})
         return None
 
     def read_file(args: dict[str, Any]) -> ToolResult:
@@ -254,7 +283,16 @@ def build_builtin_registry(workspace_root: str | Path, session_index: Any, adapt
             if virtual is not None:
                 return virtual
             return ToolResult("read_file", False, f"File not found: {path}")
-        return ToolResult("read_file", True, path.read_text(encoding="utf-8"))
+        text = path.read_text(encoding="utf-8", errors="replace")
+        limit = _read_file_max_chars()
+        if len(text) <= limit:
+            return ToolResult("read_file", True, text)
+        kept = text[-limit:]
+        content = (
+            f"[file too large to return whole: showing the LAST {limit} of {len(text)} characters — use grep or read "
+            f"specific smaller files/ranges instead of loading this file into context]\n{kept}"
+        )
+        return ToolResult("read_file", True, content, {"truncated": True, "total_chars": len(text), "kept_chars": limit})
 
     def read_json(args: dict[str, Any]) -> ToolResult:
         path = safe_path(args["path"])

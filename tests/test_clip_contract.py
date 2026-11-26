@@ -184,7 +184,10 @@ class VideoPromptContractTests(unittest.TestCase):
             prompt = pipeline._build_video_prompt(_shot(screen_guidance=None), 10.0, chained=False)
         self.assertNotIn("[Screen guidance]", prompt)
 
-    def test_voiceless_character_gets_identity_but_no_voice_lock(self):
+    def test_missing_voice_features_gets_a_derived_voice_lock(self):
+        # p4: voice_features was null for BOTH characters -> no voice lock at all ->
+        # the off-camera family line came out in Grandma's voice. The lock must
+        # fall back to age/gender cues from the character's own description.
         with tempfile.TemporaryDirectory() as tmp:
             pipeline = _pipeline(tmp)
             without_voice = [dict(GRANDMA_CHARACTERS[0], voice_features=None)]
@@ -192,7 +195,9 @@ class VideoPromptContractTests(unittest.TestCase):
                 json.dump(without_voice, f)
             prompt = pipeline._build_video_prompt(_shot(), 10.0, chained=False)
         self.assertIn("[Identity lock]", prompt)
-        self.assertNotIn("[Voice lock]", prompt)
+        self.assertIn("[Voice lock]", prompt)
+        self.assertIn("feminine voice", prompt)
+        self.assertIn("70 years old", prompt)
 
     def test_dict_shots_supported(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -317,7 +322,8 @@ class ThreeFixTests(unittest.TestCase):
 
 class CopyChainTests(unittest.IsolatedAsyncioTestCase):
     """The video loop copies the previous clip's end frame over the next
-    same-camera shot's keyframe — the chain is literal pixels."""
+    shot's keyframe — EVERY shot, camera changes included. The chain is
+    literal pixels."""
 
     def _pipeline(self, tmp):
         import asyncio
@@ -347,7 +353,7 @@ class CopyChainTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(copied.read_bytes(), b"end-pixels")
             self.assertTrue(pipeline.frame_events[1]["first_frame"].is_set())
 
-    async def test_no_copy_across_camera_change(self):
+    async def test_end_frame_copied_across_camera_change(self):
         from types import SimpleNamespace
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -362,9 +368,12 @@ class CopyChainTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
             pipeline.generate_video_for_single_shot = fake_video
-            pipeline._ensure_video_end_frame = lambda video_path, shot_idx: None
+            pipeline._ensure_video_end_frame = lambda video_path, shot_idx: str(end_frame) if shot_idx == 0 else None
             await pipeline._generate_all_shot_videos(shots)
-            self.assertFalse((Path(tmp) / "shots" / "1" / "first_frame.png").exists())
+            copied = Path(tmp) / "shots" / "1" / "first_frame.png"
+            self.assertTrue(copied.exists(), "camera changes must chain too — no fresh keyframe mid-video")
+            self.assertEqual(copied.read_bytes(), b"end-pixels")
+            self.assertTrue(pipeline.frame_events[1]["first_frame"].is_set())
 
 
 class RotationNeverTests(unittest.TestCase):
@@ -473,7 +482,8 @@ class NoDialogueTests(unittest.TestCase):
 
 class ChainFallbackTests(unittest.IsolatedAsyncioTestCase):
     """If the previous clip's end frame is unavailable, the shot's keyframe is
-    GENERATED as a fallback - never a missing first_frame.png reference."""
+    GENERATED as a fallback - never a missing first_frame.png reference.
+    Applies to EVERY shot, camera changes included."""
 
     async def test_broken_chain_generates_the_keyframe(self):
         from types import SimpleNamespace
@@ -501,3 +511,150 @@ class ChainFallbackTests(unittest.IsolatedAsyncioTestCase):
             pipeline._ensure_video_end_frame = lambda video_path, shot_idx: None  # chain broken
             await pipeline._generate_all_shot_videos(shots)
             self.assertIn((1, "first_frame", "next start"), generated)  # fallback fired for shot 1
+
+    async def test_broken_chain_generates_keyframe_across_camera_change(self):
+        from types import SimpleNamespace
+
+        with tempfile.TemporaryDirectory() as tmp:
+            import asyncio
+            pipeline = _pipeline(tmp)
+            pipeline.frame_events = {i: {"first_frame": asyncio.Event()} for i in range(2)}
+            shots = [
+                SimpleNamespace(idx=0, cam_idx=0, ff_desc="start", ff_vis_char_idxs=[], screen_guidance=None),
+                SimpleNamespace(idx=1, cam_idx=7, ff_desc="new angle start", ff_vis_char_idxs=[], screen_guidance=None),
+            ]
+            generated = []
+
+            async def fake_video(shot_description, progress=None, previous_end_frame_path=None):
+                pass
+
+            async def fake_frame(shot_idx, frame_type, first_shot_ff_path_and_text_pair, frame_desc, visible_characters, character_portraits_registry, progress=None, previous_frame_path_and_text_pair=None, screen_guidance=None):
+                generated.append((shot_idx, frame_type, frame_desc, first_shot_ff_path_and_text_pair[0]))
+                (Path(tmp) / "shots" / str(shot_idx)).mkdir(parents=True, exist_ok=True)
+                (Path(tmp) / "shots" / str(shot_idx) / "first_frame.png").write_bytes(b"gen")
+
+            pipeline.generate_video_for_single_shot = fake_video
+            pipeline.generate_frame_for_single_shot = fake_frame
+            pipeline._ensure_video_end_frame = lambda video_path, shot_idx: None  # chain broken
+            await pipeline._generate_all_shot_videos(shots)
+            self.assertIn((1, "first_frame", "new angle start", os.path.join(tmp, "shots", "0", "first_frame.png")), generated)
+
+
+class ChainColorAndVoiceTests(unittest.TestCase):
+    """p4's three model-behavior bugs: color wash-out down the chain, the
+    off-camera line spoken in Grandma's voice (no voice lock at all), and the
+    silently trimmed over-delivered clip that cut her line mid-sentence."""
+
+    def test_chained_prompt_locks_the_color_grade(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+            prompt = pipeline._build_video_prompt(_shot(), 10.0, chained=True)
+        self.assertIn("[Color lock]", prompt)
+        self.assertIn("exact color grade", prompt)
+        self.assertIn("never re-grade, wash out, soften, darken", prompt)
+        self.assertIn("identical to the reference frame", prompt)
+
+    def test_unchained_prompt_has_no_color_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+            prompt = pipeline._build_video_prompt(_shot(), 10.0, chained=False)
+        self.assertNotIn("[Color lock]", prompt)
+
+    def test_multi_speaker_clip_gets_back_to_back_pacing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+            prompt = pipeline._build_video_prompt(_shot(), 4.0, chained=False)
+        self.assertIn("[Pacing]", prompt)
+        self.assertIn("2 different speakers", prompt)
+        self.assertIn("back-to-back", prompt)
+
+    def test_single_speaker_clip_has_no_pacing_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+            prompt = pipeline._build_video_prompt(
+                _shot(audio_desc='[Speaker] Grandma Mae: "I been playing for fifty years!"'), 4.0, chained=False
+            )
+        self.assertNotIn("[Pacing]", prompt)
+
+    def test_fallback_voice_needs_no_cues_to_stay_consistent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+            from interfaces import CharacterInScene
+            fallback = pipeline._fallback_voice_features(
+                CharacterInScene.model_validate({"idx": 0, "identifier_in_scene": "Neighbor", "is_visible": True, "static_features": "a person", "voice_features": None})
+            )
+        self.assertIn("one consistent natural voice", fallback)
+
+    def test_distinct_speakers_parses_audio_desc(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+        audio = (
+            '[Speaker] Family (Off-Camera) (Warm, encouraging): "Try it on your phone!"\n'
+            '[Speaker] Grandma Mae (Curious, intrigued): "Hold up… y\'all got Downtown on here?"'
+        )
+        self.assertEqual(pipeline._distinct_speakers(audio), ["Family", "Grandma Mae"])
+        self.assertEqual(pipeline._distinct_speakers("[Ambient] room tone"), [])
+
+
+class ClipOverEventTests(unittest.IsolatedAsyncioTestCase):
+    async def test_over_delivered_clip_emits_clip_over(self):
+        events = []
+
+        class FakeVideoOutput:
+            def save(self, path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"fake-video")
+
+        class FakeVideoGenerator:
+            async def generate_single_video(self, **kwargs):
+                return FakeVideoOutput()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+            pipeline.video_generator = FakeVideoGenerator()
+            pipeline.frame_events[0] = {"first_frame": asyncio.Event()}
+            pipeline.frame_events[0]["first_frame"].set()
+            shot = _shot(duration_seconds=4.0)  # model delivered 6.04s in p4 -> line cut
+            with patch.object(pipeline, "_ensure_video_end_frame", return_value=None), \
+                 patch.object(pipeline, "_probe_duration", return_value=6.04), \
+                 patch("pipelines.script2video_pipeline._trim_video_to_seconds", return_value=True):
+                await pipeline.generate_video_for_single_shot(
+                    shot_description=shot,
+                    progress=lambda *args, **meta: events.append((args[0], args[2] if len(args) > 2 else {})),
+                )
+        stages = [stage for stage, _ in events]
+        self.assertIn("clip_over", stages)
+        over = next(meta for stage, meta in events if stage == "clip_over")
+        self.assertEqual(over["requested_seconds"], 4.0)
+        self.assertEqual(over["delivered_seconds"], 6.04)
+        self.assertEqual(over["over_by_seconds"], 2.04)
+
+    async def test_on_budget_clip_emits_nothing(self):
+        events = []
+
+        class FakeVideoOutput:
+            def save(self, path):
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(b"fake-video")
+
+        class FakeVideoGenerator:
+            async def generate_single_video(self, **kwargs):
+                return FakeVideoOutput()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pipeline = _pipeline(tmp)
+            pipeline.video_generator = FakeVideoGenerator()
+            pipeline.frame_events[0] = {"first_frame": asyncio.Event()}
+            pipeline.frame_events[0]["first_frame"].set()
+            with patch.object(pipeline, "_ensure_video_end_frame", return_value=None), \
+                 patch.object(pipeline, "_probe_duration", return_value=4.1), \
+                 patch("pipelines.script2video_pipeline._trim_video_to_seconds", return_value=False):
+                await pipeline.generate_video_for_single_shot(
+                    shot_description=_shot(duration_seconds=4.0),
+                    progress=lambda *args, **meta: events.append((args[0], args[2] if len(args) > 2 else {})),
+                )
+        stages = [stage for stage, _ in events]
+        self.assertNotIn("clip_over", stages)
+        self.assertNotIn("clip_short", stages)

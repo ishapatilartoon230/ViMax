@@ -24,6 +24,63 @@ class ToolRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(json.loads((Path(tmp) / "data" / "a.json").read_text())["x"], 1)
             self.assertTrue((Path(tmp) / ".vimax" / "logs" / "tool_calls.jsonl").exists())
 
+    async def test_read_file_returns_huge_files_truncated_from_the_tail(self):
+        # p6: reading a giant log whole dragged 1.6M tokens into the context.
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            index.create()
+            registry = build_builtin_registry(tmp, index)
+            executor = ToolExecutor(registry, index)
+            giant = Path(tmp) / "giant.log"
+            giant.write_text("x" * 250_000 + "THE-TAIL-MARKER", encoding="utf-8")
+            record = await executor.execute(ToolCall(name="read_file", arguments={"path": "giant.log"}), TurnControl())
+            self.assertTrue(record.result.ok)
+            content = record.result.content
+            self.assertTrue(content.startswith("[file too large"), content[:80])
+            self.assertIn("THE-TAIL-MARKER", content)  # the tail is what survives
+            self.assertLessEqual(len(content), 210_000)
+            self.assertTrue(record.result.metadata["truncated"])
+            self.assertEqual(record.result.metadata["total_chars"], 250_000 + len("THE-TAIL-MARKER"))
+
+    async def test_virtual_session_log_read_is_row_capped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(session_id="20260630-125442-vimax", idea="caps")
+            for i in range(250):
+                index.append_turn_record(record["session_id"], {"turn_id": f"turn-{i}", "status": "completed", "final_assistant_text": "done"})
+            registry = build_builtin_registry(tmp, index)
+            executor = ToolExecutor(registry, index)
+            result = await executor.execute(
+                ToolCall(name="read_file", arguments={"path": ".vimax/logs/20260630-125442-vimax.log"}),
+                TurnControl(),
+            )
+            self.assertTrue(result.result.ok)
+            payload = json.loads(result.result.content)
+            self.assertEqual(len(payload["records"]), 200)
+            self.assertTrue(payload["truncated_to_most_recent"])
+
+    async def test_virtual_session_log_read_merges_dated_archives(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            index = SessionIndex(tmp)
+            record = index.create(session_id="20260630-125442-vimax", idea="dated")
+            logs = Path(tmp) / ".vimax" / "logs"
+            logs.mkdir(parents=True, exist_ok=True)
+            (logs / "loop_history-2026-06-29.jsonl").write_text(
+                json.dumps({"session_id": record["session_id"], "event": "old-day"}) + "\n", encoding="utf-8"
+            )
+            index.append_turn_record(record["session_id"], {"turn_id": "turn-today", "status": "completed", "final_assistant_text": "done"})
+            registry = build_builtin_registry(tmp, index)
+            executor = ToolExecutor(registry, index)
+            result = await executor.execute(
+                ToolCall(name="read_file", arguments={"path": ".vimax/logs/20260630-125442-vimax.log"}),
+                TurnControl(),
+            )
+            payload = json.loads(result.result.content)
+            events = [item.get("event") for item in payload["records"]]
+            turn_ids = [item.get("turn_id") for item in payload["records"]]
+            self.assertIn("old-day", events)  # from the dated archive
+            self.assertIn("turn-today", turn_ids)  # from the live file
+
     async def test_unknown_and_missing_argument_return_tool_errors(self):
         with tempfile.TemporaryDirectory() as tmp:
             index = SessionIndex(tmp)
